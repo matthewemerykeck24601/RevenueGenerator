@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import csv
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+class TradeJournal:
+    def __init__(self, folder: str = "logs") -> None:
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.folder / "cycles.csv"
+        self.db_path = self.folder / "trades.db"
+        self._init_db()
+        self._init_csv()
+
+    def _init_csv(self) -> None:
+        if self.csv_path.exists():
+            pass
+        else:
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "segment",
+                        "budget",
+                        "execute",
+                        "account_status",
+                        "signals_considered",
+                        "orders_planned_count",
+                        "orders_placed_count",
+                        "notes",
+                    ]
+                )
+
+        exit_csv_path = self.folder / "exit_actions.csv"
+        if not exit_csv_path.exists():
+            with open(exit_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "symbol",
+                        "trigger",
+                        "qty",
+                        "price",
+                        "pnl_pct",
+                        "execute",
+                        "result",
+                    ]
+                )
+
+    def _init_db(self) -> None:
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    segment TEXT NOT NULL,
+                    budget REAL NOT NULL,
+                    execute INTEGER NOT NULL,
+                    account_status TEXT,
+                    signals_considered INTEGER NOT NULL,
+                    orders_planned_json TEXT NOT NULL,
+                    orders_placed_json TEXT NOT NULL,
+                    notes TEXT
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exit_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    price REAL NOT NULL,
+                    pnl_pct REAL NOT NULL,
+                    execute INTEGER NOT NULL,
+                    result_json TEXT NOT NULL
+                )
+                """
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def log_cycle(self, result: dict[str, Any]) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        segment = str(result.get("segment", "unknown"))
+        budget = float(result.get("budget", 0.0))
+        execute = 1 if bool(result.get("execute", False)) else 0
+        account_status = str(result.get("account_status", "unknown"))
+        signals_considered = int(result.get("signals_considered", 0))
+        planned = result.get("orders_planned", [])
+        placed = result.get("orders_placed", [])
+        notes = str(result.get("reason", ""))
+
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    ts,
+                    segment,
+                    budget,
+                    execute,
+                    account_status,
+                    signals_considered,
+                    len(planned),
+                    len(placed),
+                    notes,
+                ]
+            )
+
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                """
+                INSERT INTO cycles (
+                    ts, segment, budget, execute, account_status, signals_considered,
+                    orders_planned_json, orders_placed_json, notes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    segment,
+                    budget,
+                    execute,
+                    account_status,
+                    signals_considered,
+                    json.dumps(planned),
+                    json.dumps(placed),
+                    notes,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def log_exit_action(
+        self,
+        *,
+        symbol: str,
+        trigger: str,
+        qty: float,
+        price: float,
+        pnl_pct: float,
+        execute: bool,
+        result: dict[str, Any],
+    ) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        exit_csv_path = self.folder / "exit_actions.csv"
+        with open(exit_csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    ts,
+                    symbol,
+                    trigger,
+                    f"{qty:.6f}",
+                    f"{price:.6f}",
+                    f"{pnl_pct:.4f}",
+                    1 if execute else 0,
+                    json.dumps(result, separators=(",", ":")),
+                ]
+            )
+
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                """
+                INSERT INTO exit_actions (ts, symbol, trigger, qty, price, pnl_pct, execute, result_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    symbol,
+                    trigger,
+                    qty,
+                    price,
+                    pnl_pct,
+                    1 if execute else 0,
+                    json.dumps(result),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()

@@ -1,0 +1,152 @@
+{
+  "version": "1.0.0",
+  "maxDailyLossPct": 3.0,
+  "maxDrawdownPct": 10.0,
+  "maxPositionSizePct": 8.0,
+  "maxOpenPositions": 15,
+  "buyCooldownMinutes": 25,
+  "allowAddOnBuys": true,
+  "maxEntriesPerSymbol": 4,
+  "addOnBuyCooldownMinutes": 8,
+  "entryCountLookbackHours": 48,
+  "cancelOpenOrdersBeforeRun": true,
+  "cancelOpenOrdersAfterMinutes": 20,
+  "equityBracketsEnabled": false,
+  "minSignalConfidence": 0.35,
+  "minExpectedEdge": -0.08,
+  "externalResearch": {
+    "enabled": true,
+    "topCandidatesPerSegment": 20
+  },
+  "aiScheduler": {
+    "enabled": true,
+    "segments": [
+      "pennyStocks",
+      "indexFunds"
+    ],
+    "fallbackToRuleEngine": true,
+    "openclawTimeoutSeconds": 35,
+    "minBudgetUsd": 25
+  },
+  "sectorCadence": {
+    "pennyStocks": {
+      "enabled": true,
+      "intervalSeconds": 120,
+      "budgetPct": 65
+    },
+    "crypto": {
+      "enabled": true,
+      "intervalSeconds": 420,
+      "budgetPct": 15
+    },
+    "indexFunds": {
+      "enabled": true,
+      "intervalSeconds": 900,
+      "budgetPct": 20
+    }
+  },
+  "takeProfitPct": 4.5,
+  "stopLossPct": 2.2,
+  "allowedSegments": {
+    "crypto": {
+      "enabled": true,
+      "maxSpreadBps": 70,
+      "maxSignals": 2,
+      "symbolsAllowlist": [
+        "BTC/USD",
+        "ETH/USD",
+        "SOL/USD",
+        "AVAX/USD",
+        "LTC/USD",
+        "LINK/USD",
+        "BCH/USD",
+        "UNI/USD",
+        "AAVE/USD"
+      ]
+    },
+    "pennyStocks": {
+      "enabled": true,
+      "maxSpreadBps": 120,
+      "maxSignals": 6,
+      "minDollarVolume": 1500000,
+      "symbolsAllowlist": [
+        "SNDL",
+        "TNXP",
+        "AEMD",
+        "CTRM",
+        "XELA",
+        "HSDT",
+        "MARA",
+        "RIOT",
+        "HUT",
+        "BITF",
+        "CIFR",
+        "WULF",
+        "IONQ",
+        "SOUN"
+      ]
+    },
+    "largeCapStocks": {
+      "enabled": true,
+      "maxSpreadBps": 30,
+      "maxSignals": 2,
+      "symbolsAllowlist": [
+        "NVDA",
+        "MSFT",
+        "AAPL",
+        "AMZN",
+        "GOOGL",
+        "META"
+      ]
+    },
+    "indexFunds": {
+      "enabled": true,
+      "maxSpreadBps": 12,
+      "maxSignals": 1,
+      "symbolsAllowlist": [
+        "SPY",
+        "QQQ",
+        "DIA",
+        "IWM",
+        "VTI",
+        "VOO",
+        "IVV"
+      ]
+    }
+  },
+  "orderDefaults": {
+    "stocks": {
+      "type": "limit",
+      "timeInForce": "day"
+    },
+    "crypto": {
+      "type": "limit",
+      "timeInForce": "gtc"
+    }
+  },
+  "tradingHours": {
+    "stocks": "market_hours_only",
+    "crypto": "24_7"
+  },
+  "killSwitch": {
+    "enabled": true,
+    "tripOnConsecutiveLosses": 5,
+    "tripOnDailyLossPct": 3.0,
+    "manualOverrideRequired": true
+  },
+  "pdtGuard": {
+    "enabled": true,
+    "thresholdDayTrades": 3,
+    "allowOnlyHardStopAtThreshold": true
+  },
+  "exitHooks": {
+    "firstTargetPct": 3.0,
+    "firstTargetSellPct": 40.0,
+    "secondTargetPct": 6.0,
+    "secondTargetSellPct": 30.0,
+    "trailingStopPct": 1.8,
+    "breakEvenBufferPct": 0.15,
+    "hardStopLossPct": 2.4,
+    "minNotionalExitUsd": 5.0
+  }
+}

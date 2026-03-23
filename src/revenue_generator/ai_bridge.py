@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from .alpaca_client import AlpacaClient
+from .bot import SEGMENT_UNIVERSE
+
+
+@dataclass
+class AiSignalDecision:
+    allowed: bool
+    reason: str
+    normalized_signal: dict[str, Any]
+    planned_order: dict[str, Any] | None
+
+
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        for idx in range(len(text)):
+            if text[idx] != "{":
+                continue
+            try:
+                obj, _end = decoder.raw_decode(text[idx:])
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("No valid JSON object found in model output.")
+
+
+def build_openclaw_prompt(*, segment: str, budget: float, allowed_symbols: list[str], risk_policy: dict[str, Any]) -> str:
+    max_pos = float(risk_policy.get("maxPositionSizePct", 12.0))
+    max_open = int(risk_policy.get("maxOpenPositions", 3))
+    stop_loss = float(risk_policy.get("stopLossPct", 2.2))
+    tp1 = float((risk_policy.get("exitHooks") or {}).get("firstTargetPct", 3.0))
+    tp2 = float((risk_policy.get("exitHooks") or {}).get("secondTargetPct", 6.0))
+
+    return f"""
+You are generating one strict trading signal for an execution engine.
+
+Constraints:
+- Segment: {segment}
+- Total budget USD: {budget:.2f}
+- Max position size pct of budget: {max_pos:.2f}
+- Max open positions: {max_open}
+- Allowed symbols: {", ".join(allowed_symbols)}
+- Baseline stop loss pct: {stop_loss:.2f}
+- Target 1 pct: {tp1:.2f}
+- Target 2 pct: {tp2:.2f}
+
+Rules:
+- If confidence < 0.62 or expected_edge <= 0.03, return HOLD.
+- Never output symbols outside allowlist.
+- For HOLD, set "symbol" to null and position_size_pct_of_budget to 0.
+- Use exact symbol formatting from allowlist (for example BTC/USD, not BTCUSDT).
+- Never exceed max position size pct.
+- Output JSON only, no markdown.
+
+Schema:
+{{
+  "decision": "BUY|SELL|HOLD",
+  "symbol": "SYMBOL_OR_NULL",
+  "segment": "{segment}",
+  "confidence": 0.0,
+  "expected_edge": 0.0,
+  "position_size_pct_of_budget": 0.0,
+  "entry": {{
+    "order_type": "limit|market",
+    "limit_price": 0.0,
+    "time_in_force": "gtc|day"
+  }},
+  "reasoning": ["short reason 1", "short reason 2"]
+}}
+""".strip()
+
+
+def run_openclaw_analysis(
+    *,
+    segment: str,
+    budget: float,
+    allowed_symbols: list[str],
+    risk_policy: dict[str, Any],
+    timeout_seconds: int = 35,
+) -> dict[str, Any]:
+    prompt = build_openclaw_prompt(
+        segment=segment,
+        budget=budget,
+        allowed_symbols=allowed_symbols,
+        risk_policy=risk_policy,
+    )
+    openclaw_bin = shutil.which("openclaw")
+    if not openclaw_bin:
+        fallback = os.path.expanduser(r"~\AppData\Roaming\npm\openclaw.cmd")
+        openclaw_bin = fallback if os.path.exists(fallback) else "openclaw"
+
+    cmd = [
+        openclaw_bin,
+        "agent",
+        "--local",
+        "--agent",
+        "main",
+        "--message",
+        prompt,
+        "--json",
+    ]
+    if os.name == "nt":
+        command_str = subprocess.list2cmdline(cmd)
+        proc = subprocess.run(
+            command_str,
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(5, timeout_seconds),
+        )
+    else:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(5, timeout_seconds),
+        )
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.strip() or stdout.strip() or "openclaw agent failed")
+    return _extract_json_object(stdout)
+
+
+def validate_and_plan_signal(
+    *,
+    signal: dict[str, Any],
+    budget: float,
+    segment: str,
+    risk_policy: dict[str, Any],
+    account: dict[str, Any],
+    open_positions: list[dict[str, Any]],
+    client: AlpacaClient,
+) -> AiSignalDecision:
+    decision = str(signal.get("decision", "HOLD")).upper()
+    symbol = str(signal.get("symbol") or "")
+    confidence = _to_float(signal.get("confidence"))
+    expected_edge = _to_float(signal.get("expected_edge"))
+    size_pct = _to_float(signal.get("position_size_pct_of_budget"))
+
+    normalized = {
+        "decision": decision,
+        "symbol": symbol,
+        "segment": segment,
+        "confidence": confidence,
+        "expected_edge": expected_edge,
+        "position_size_pct_of_budget": size_pct,
+        "entry": signal.get("entry", {}),
+        "reasoning": signal.get("reasoning", []),
+    }
+
+    segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
+    if not segment_cfg.get("enabled", True):
+        return AiSignalDecision(False, f"Segment '{segment}' disabled in risk policy.", normalized, None)
+
+    if decision == "HOLD":
+        return AiSignalDecision(False, "Model returned HOLD.", normalized, None)
+    if decision not in {"BUY", "SELL"}:
+        return AiSignalDecision(False, "Invalid decision in signal.", normalized, None)
+
+    allowed_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
+    if symbol not in allowed_symbols:
+        return AiSignalDecision(False, f"Symbol '{symbol}' not allowed for segment '{segment}'.", normalized, None)
+
+    if confidence < 0.62 or expected_edge <= 0.03:
+        return AiSignalDecision(False, "Signal does not pass confidence/edge thresholds.", normalized, None)
+
+    max_open = int(risk_policy.get("maxOpenPositions", 3))
+    if len(open_positions) >= max_open and decision == "BUY":
+        return AiSignalDecision(False, "Max open positions reached.", normalized, None)
+
+    max_size_pct = float(risk_policy.get("maxPositionSizePct", 12.0))
+    if size_pct <= 0 or size_pct > max_size_pct:
+        return AiSignalDecision(False, f"Position size pct {size_pct:.2f} exceeds policy max {max_size_pct:.2f}.", normalized, None)
+
+    equity = _to_float(account.get("equity"), budget)
+    if equity <= 0:
+        equity = budget
+    alloc = min(budget * (size_pct / 100.0), equity * (size_pct / 100.0))
+    if alloc <= 0:
+        return AiSignalDecision(False, "Calculated allocation is zero.", normalized, None)
+
+    latest_price = client.get_latest_price(symbol)
+    if latest_price is None or latest_price <= 0:
+        return AiSignalDecision(False, f"Could not fetch latest price for {symbol}.", normalized, None)
+
+    raw_qty = alloc / latest_price
+    is_crypto = "/" in symbol
+    qty: float | int
+    if is_crypto:
+        qty = round(raw_qty, 6)
+        if qty <= 0:
+            return AiSignalDecision(False, "Calculated crypto quantity is zero.", normalized, None)
+    else:
+        qty = int(raw_qty)
+        if qty < 1:
+            return AiSignalDecision(False, "Calculated stock quantity is less than one share.", normalized, None)
+
+    entry = signal.get("entry", {}) or {}
+    order_type = str(entry.get("order_type", "limit")).lower()
+    if order_type not in {"limit", "market"}:
+        order_type = "limit"
+    tif = str(entry.get("time_in_force", "gtc" if is_crypto else "day")).lower()
+    limit_price = _to_float(entry.get("limit_price"), latest_price)
+    if order_type == "limit" and limit_price <= 0:
+        limit_price = latest_price
+
+    planned = {
+        "symbol": symbol,
+        "side": "buy" if decision == "BUY" else "sell",
+        "qty": qty,
+        "order_type": order_type,
+        "time_in_force": tif,
+        "limit_price": round(limit_price, 6),
+        "latest_price": latest_price,
+        "allocation": round(alloc, 2),
+    }
+    return AiSignalDecision(True, "Signal approved by risk gate.", normalized, planned)
+
+
+def run_ai_cycle(
+    *,
+    client: AlpacaClient,
+    risk_policy: dict[str, Any],
+    segment: str,
+    budget: float,
+    execute: bool,
+) -> dict[str, Any]:
+    ai_cfg = risk_policy.get("aiScheduler", {})
+    timeout_seconds = int(ai_cfg.get("openclawTimeoutSeconds", 35))
+    segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
+    allowed_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
+    min_budget = float(ai_cfg.get("minBudgetUsd", 25.0))
+    if budget < min_budget:
+        return {
+            "segment": segment,
+            "budget": budget,
+            "execute": execute,
+            "ai_used": False,
+            "reason": f"Budget below AI min threshold ({min_budget}).",
+        }
+    if not allowed_symbols:
+        return {
+            "segment": segment,
+            "budget": budget,
+            "execute": execute,
+            "ai_used": False,
+            "reason": "No symbols configured for segment.",
+        }
+
+    # Optional pre-run cleanup to avoid cash lockup from stale buy orders.
+    stale_minutes = int(risk_policy.get("cancelOpenOrdersAfterMinutes", 20))
+    cancel_open_before_run = bool(risk_policy.get("cancelOpenOrdersBeforeRun", True))
+    cancelled_order_ids: list[str] = []
+    if execute and cancel_open_before_run and stale_minutes > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+        try:
+            open_orders = client.get_orders(status="open", limit=200, direction="desc")
+            for order in open_orders:
+                if str(order.get("side", "")).lower() != "buy":
+                    continue
+                order_id = order.get("id")
+                if not order_id:
+                    continue
+                created_at = order.get("created_at") or order.get("submitted_at")
+                if not created_at:
+                    continue
+                dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                if dt <= cutoff:
+                    try:
+                        client.cancel_order(str(order_id))
+                        cancelled_order_ids.append(str(order_id))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    signal = run_openclaw_analysis(
+        segment=segment,
+        budget=budget,
+        allowed_symbols=allowed_symbols,
+        risk_policy=risk_policy,
+        timeout_seconds=timeout_seconds,
+    )
+    account = client.get_account()
+    positions = client.get_open_positions()
+    decision = validate_and_plan_signal(
+        signal=signal,
+        budget=budget,
+        segment=segment,
+        risk_policy=risk_policy,
+        account=account,
+        open_positions=positions,
+        client=client,
+    )
+
+    placed = None
+    place_error = None
+    if decision.allowed and decision.planned_order and execute:
+        planned = decision.planned_order
+        try:
+            placed = client.place_order(
+                symbol=planned["symbol"],
+                qty=planned["qty"],
+                side=planned["side"],
+                order_type=planned["order_type"],
+                tif=planned["time_in_force"],
+                limit_price=planned["limit_price"] if planned["order_type"] == "limit" else None,
+            )
+        except Exception as err:
+            place_error = str(err)
+
+    return {
+        "account_status": account.get("status"),
+        "segment": segment,
+        "budget": budget,
+        "execute": execute,
+        "ai_used": True,
+        "stale_orders_cancelled": len(cancelled_order_ids),
+        "ai_signal": decision.normalized_signal,
+        "ai_allowed": decision.allowed,
+        "ai_reason": decision.reason,
+        "orders_planned": [decision.planned_order] if decision.planned_order else [],
+        "orders_placed": [placed] if placed else [],
+        "order_errors": ([{"symbol": decision.planned_order.get("symbol"), "error": place_error}] if place_error and decision.planned_order else []),
+    }
+

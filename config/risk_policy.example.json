@@ -1,0 +1,112 @@
+{
+  "version": "1.0.0",
+  "maxDailyLossPct": 2.0,
+  "maxDrawdownPct": 8.0,
+  "maxPositionSizePct": 10.0,
+  "maxOpenPositions": 5,
+  "buyCooldownMinutes": 180,
+  "minSignalConfidence": 0.5,
+  "minExpectedEdge": 0.0,
+  "externalResearch": {
+    "enabled": true,
+    "topCandidatesPerSegment": 10
+  },
+  "sectorCadence": {
+    "pennyStocks": {
+      "enabled": true,
+      "intervalSeconds": 180,
+      "budgetPct": 35
+    },
+    "crypto": {
+      "enabled": true,
+      "intervalSeconds": 300,
+      "budgetPct": 35
+    },
+    "indexFunds": {
+      "enabled": true,
+      "intervalSeconds": 1200,
+      "budgetPct": 30
+    }
+  },
+  "takeProfitPct": 4.0,
+  "stopLossPct": 2.0,
+  "allowedSegments": {
+    "crypto": {
+      "enabled": true,
+      "maxSpreadBps": 40,
+      "symbolsAllowlist": [
+        "BTC/USD",
+        "ETH/USD",
+        "SOL/USD",
+        "LINK/USD"
+      ]
+    },
+    "pennyStocks": {
+      "enabled": true,
+      "maxSpreadBps": 80,
+      "minDollarVolume": 1000000,
+      "symbolsAllowlist": [
+        "SNDL",
+        "MULN",
+        "TNXP",
+        "AEMD",
+        "CTRM",
+        "XELA"
+      ]
+    },
+    "largeCapStocks": {
+      "enabled": true,
+      "maxSpreadBps": 20,
+      "symbolsAllowlist": [
+        "AAPL",
+        "MSFT",
+        "GOOGL"
+      ]
+    },
+    "indexFunds": {
+      "enabled": true,
+      "maxSpreadBps": 12,
+      "symbolsAllowlist": [
+        "SPY",
+        "QQQ",
+        "DIA",
+        "IWM"
+      ]
+    }
+  },
+  "orderDefaults": {
+    "stocks": {
+      "type": "limit",
+      "timeInForce": "day"
+    },
+    "crypto": {
+      "type": "limit",
+      "timeInForce": "gtc"
+    }
+  },
+  "tradingHours": {
+    "stocks": "market_hours_only",
+    "crypto": "24_7"
+  },
+  "killSwitch": {
+    "enabled": true,
+    "tripOnConsecutiveLosses": 5,
+    "tripOnDailyLossPct": 2.0,
+    "manualOverrideRequired": true
+  },
+  "pdtGuard": {
+    "enabled": true,
+    "thresholdDayTrades": 3,
+    "allowOnlyHardStopAtThreshold": true
+  },
+  "exitHooks": {
+    "firstTargetPct": 2.5,
+    "firstTargetSellPct": 40.0,
+    "secondTargetPct": 5.0,
+    "secondTargetSellPct": 30.0,
+    "trailingStopPct": 2.0,
+    "breakEvenBufferPct": 0.1,
+    "hardStopLossPct": 2.2,
+    "minNotionalExitUsd": 5.0
+  }
+}
