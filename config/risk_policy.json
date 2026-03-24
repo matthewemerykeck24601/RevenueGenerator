@@ -2,7 +2,41 @@
   "version": "1.0.0",
   "maxDailyLossPct": 3.0,
   "maxDrawdownPct": 10.0,
-  "maxPositionSizePct": 8.0,
+  "maxPositionSizePct": 12.0,
+  "allowFractionalStocks": true,
+  "equityModeSwitch": {
+    "enabled": true,
+    "thresholdUsd": 25000,
+    "reenableBufferUsd": 1500,
+    "conservative": {
+      "pdtGuardEnabled": true,
+      "maxPositionSizePct": 12.0,
+      "maxOpenPositions": 20,
+      "aiMinConfidenceForBuy": 0.5,
+      "aiMinExpectedEdgeForBuy": 0.0,
+      "allowAddOnBuys": true,
+      "sectorBudgetPct": {
+        "largeCapStocks": 45,
+        "indexFunds": 35,
+        "crypto": 15,
+        "pennyStocks": 5
+      }
+    },
+    "aggressive": {
+      "pdtGuardEnabled": false,
+      "maxPositionSizePct": 16.0,
+      "maxOpenPositions": 28,
+      "aiMinConfidenceForBuy": 0.42,
+      "aiMinExpectedEdgeForBuy": 0.0,
+      "allowAddOnBuys": true,
+      "sectorBudgetPct": {
+        "largeCapStocks": 50,
+        "indexFunds": 30,
+        "crypto": 20,
+        "pennyStocks": 0
+      }
+    }
+  },
   "maxOpenPositions": 20,
   "buyCooldownMinutes": 20,
   "allowAddOnBuys": true,
@@ -30,10 +64,10 @@
       "crypto"
     ],
     "fallbackToRuleEngine": true,
-    "openclawTimeoutSeconds": 45,
+    "aiTimeoutSeconds": 45,
     "prefilterScoreThreshold": 0.004,
     "minBudgetUsd": 50,
-    "minConfidenceForBuy": 0.55,
+    "minConfidenceForBuy": 0.5,
     "minExpectedEdgeForBuy": 0.0,
     "slippageBufferBpsStocks": 5,
     "slippageBufferBpsCrypto": 10,
@@ -53,12 +87,12 @@
     "indexFunds": {
       "enabled": true,
       "intervalSeconds": 300,
-      "budgetPct": 45
+      "budgetPct": 35
     },
     "largeCapStocks": {
       "enabled": true,
       "intervalSeconds": 420,
-      "budgetPct": 35
+      "budgetPct": 45
     },
     "crypto": {
       "enabled": true,

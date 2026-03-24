@@ -2,7 +2,29 @@
   "version": "1.0.0",
   "maxDailyLossPct": 2.0,
   "maxDrawdownPct": 8.0,
-  "maxPositionSizePct": 10.0,
+  "maxPositionSizePct": 12.0,
+  "allowFractionalStocks": true,
+  "equityModeSwitch": {
+    "enabled": true,
+    "thresholdUsd": 25000,
+    "reenableBufferUsd": 1500,
+    "conservative": {
+      "pdtGuardEnabled": true,
+      "maxPositionSizePct": 12.0,
+      "maxOpenPositions": 5,
+      "aiMinConfidenceForBuy": 0.5,
+      "aiMinExpectedEdgeForBuy": 0.05,
+      "allowAddOnBuys": false
+    },
+    "aggressive": {
+      "pdtGuardEnabled": false,
+      "maxPositionSizePct": 16.0,
+      "maxOpenPositions": 10,
+      "aiMinConfidenceForBuy": 0.42,
+      "aiMinExpectedEdgeForBuy": 0.0,
+      "allowAddOnBuys": true
+    }
+  },
   "maxOpenPositions": 5,
   "buyCooldownMinutes": 180,
   "minSignalConfidence": 0.65,
@@ -23,10 +45,10 @@
       "indexFunds"
     ],
     "fallbackToRuleEngine": true,
-    "openclawTimeoutSeconds": 35,
+    "aiTimeoutSeconds": 35,
     "prefilterScoreThreshold": 0.6,
     "minBudgetUsd": 25,
-    "minConfidenceForBuy": 0.7,
+    "minConfidenceForBuy": 0.5,
     "minExpectedEdgeForBuy": 0.05,
     "slippageBufferBpsStocks": 6,
     "slippageBufferBpsCrypto": 12,

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .alpaca_client import AlpacaClient
+from .equity_mode import apply_equity_mode_switch
 from .external_research import select_external_candidates, should_skip_cycle_for_vix
 from .risk import evaluate_risk
 from .strategy import Signal, select_top_signals
@@ -21,7 +22,7 @@ SEGMENT_UNIVERSE: dict[str, list[str]] = {
 @dataclass
 class PlannedOrder:
     symbol: str
-    qty: int
+    qty: float | int
     limit_price: float
     confidence: float
     expected_edge: float
@@ -120,6 +121,7 @@ def build_orders(
     max_open_positions = int(risk_policy.get("maxOpenPositions", 5))
     max_daily_loss_pct = float(risk_policy.get("maxDailyLossPct", 2.0))
     max_position_size_pct = float(risk_policy.get("maxPositionSizePct", 10.0))
+    allow_fractional_stocks = bool(risk_policy.get("allowFractionalStocks", True))
 
     orders: list[PlannedOrder] = []
     remaining_budget = budget
@@ -138,11 +140,22 @@ def build_orders(
             break
 
         allowed_alloc = min(decision.max_alloc_dollars, remaining_budget)
-        qty = int(allowed_alloc // sig.last_price)
-        if qty < 1 and remaining_budget >= sig.last_price:
-            qty = 1
-        if qty < 1:
-            continue
+        is_crypto = "/" in sig.symbol
+        qty: float | int
+        if is_crypto:
+            qty = round(allowed_alloc / sig.last_price, 6)
+            if qty <= 0:
+                continue
+        elif allow_fractional_stocks:
+            qty = round(allowed_alloc / sig.last_price, 6)
+            if qty <= 0:
+                continue
+        else:
+            qty = int(allowed_alloc // sig.last_price)
+            if qty < 1 and remaining_budget >= sig.last_price:
+                qty = 1
+            if qty < 1:
+                continue
 
         # Slight discount below last for better fill quality.
         limit_price = _round_limit(sig.last_price * 0.998)
@@ -176,12 +189,13 @@ def run_once(
 
     account = client.get_account()
     positions = client.get_open_positions()
+    equity_mode = apply_equity_mode_switch(risk_policy, account=account)
     start_equity = float(account.get("last_equity", account.get("equity", "0")))
     current_equity = float(account.get("equity", "0"))
 
     segment_cfg = risk_policy.get("allowedSegments", {}).get(segment, {})
     if not segment_cfg.get("enabled", True):
-        return {"orders": [], "reason": f"Segment '{segment}' disabled in risk policy."}
+        return {"orders": [], "reason": f"Segment '{segment}' disabled in risk policy.", "equity_mode": equity_mode}
 
     universe = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE[segment]
     external_cfg = risk_policy.get("externalResearch", {})
@@ -207,6 +221,7 @@ def run_once(
                 "orders_planned": [],
                 "orders_placed": [],
                 "order_errors": [],
+                "equity_mode": equity_mode,
             }
     if external_cfg.get("enabled", True):
         top_n = int(external_cfg.get("topCandidatesPerSegment", 12))
@@ -371,4 +386,5 @@ def run_once(
         "orders_placed": placed,
         "order_errors": order_errors,
         "execute": execute,
+        "equity_mode": equity_mode,
     }

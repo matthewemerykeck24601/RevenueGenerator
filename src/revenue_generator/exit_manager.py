@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .alpaca_client import AlpacaClient
+from .equity_mode import apply_equity_mode_switch
 from .journal import TradeJournal
 
 
@@ -107,13 +108,15 @@ class ExitManager:
         if not positions:
             return {"positions": 0, "actions": [], "execute": execute}
 
+        account = self.client.get_account()
+        equity_mode = apply_equity_mode_switch(self.risk_policy, account=account)
         pdt_cfg = (self.risk_policy.get("pdtGuard") or {})
         pdt_guard_enabled = bool(pdt_cfg.get("enabled", True))
         pdt_threshold = int(pdt_cfg.get("thresholdDayTrades", 3))
         pdt_allow_only_hard_stop = bool(pdt_cfg.get("allowOnlyHardStopAtThreshold", True))
         pdt_near_limit_buffer = int(pdt_cfg.get("nearLimitBuffer", 1))
-        account = self.client.get_account() if pdt_guard_enabled else {}
-        daytrade_count = int(float(account.get("daytrade_count", 0) or 0)) if pdt_guard_enabled else 0
+        pdt_account = account if pdt_guard_enabled else {}
+        daytrade_count = int(float(pdt_account.get("daytrade_count", 0) or 0)) if pdt_guard_enabled else 0
         pdt_near_limit = daytrade_count >= max(0, pdt_threshold - max(0, pdt_near_limit_buffer))
         bought_today_equities: set[str] = set()
         if pdt_guard_enabled:
@@ -261,6 +264,7 @@ class ExitManager:
             "pdt_threshold": pdt_threshold,
             "pdt_near_limit": pdt_near_limit,
             "pdt_blocked_exits": pdt_blocked_exits,
+            "equity_mode": equity_mode,
             "execute": execute,
             "exit_config": self.cfg.__dict__,
         }

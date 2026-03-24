@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from revenue_generator.alpaca_client import AlpacaClient
-from revenue_generator.ai_bridge import run_openclaw_analysis, validate_and_plan_signal
+from revenue_generator.ai_bridge import run_ai_analysis, validate_and_plan_signal
 from revenue_generator.config import build_runtime_config, ensure_risk_policy
 from revenue_generator.exit_manager import ExitManager
 from revenue_generator.journal import TradeJournal
@@ -304,9 +304,9 @@ def api_status():
 def api_ai_health():
     return jsonify(
         {
-            "openclaw_gateway": "ws://127.0.0.1:18789",
-            "analysis_mode": "openclaw_local_agent",
-            "note": "Requires OpenClaw model auth profile key (Anthropic/OpenAI/etc) for agent turns.",
+            "analysis_mode": "direct_provider_api",
+            "providers_supported": ["anthropic", "openai"],
+            "note": "Configure ANTHROPIC_API_KEY or OPENAI_API_KEY in .env for AI turns.",
         }
     )
 
@@ -323,7 +323,7 @@ def api_ai_analyze():
         return jsonify({"ok": False, "error": f"No allowed symbols configured for segment '{segment}'."}), 400
 
     try:
-        signal = run_openclaw_analysis(
+        signal = run_ai_analysis(
             segment=segment,
             budget=budget,
             allowed_symbols=allowed_symbols,

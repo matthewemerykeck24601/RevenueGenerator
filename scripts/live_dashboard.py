@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,46 @@ class ReserveStateStore:
 
 
 reserve_store = ReserveStateStore(RESERVE_STATE_PATH)
+
+
+def _kill_scheduler_processes() -> dict[str, Any]:
+    # Stops any running multi-sector scheduler Python process.
+    ps_script = r"""
+$procs = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object {
+  $_.CommandLine -like '*run_multi_sector_scheduler.py*'
+}
+$killed = @()
+foreach ($p in $procs) {
+  try {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+    $killed += $p.ProcessId
+  } catch {}
+}
+$result = @{
+  killed = $killed
+  count = $killed.Count
+}
+$result | ConvertTo-Json -Compress
+"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "count": 0, "killed": [], "error": proc.stderr.strip() or "kill command failed"}
+        data = json.loads((proc.stdout or "{}").strip() or "{}")
+        killed = data.get("killed") or []
+        if isinstance(killed, int):
+            killed = [killed]
+        return {"ok": True, "count": int(data.get("count", len(killed))), "killed": killed}
+    except Exception as err:
+        return {"ok": False, "count": 0, "killed": [], "error": str(err)}
 
 
 def _build_dashboard_payload() -> dict[str, Any]:
@@ -291,6 +332,23 @@ LIVE_HTML = """
       body { margin: 0; padding: 16px; font-family: "Segoe UI", Arial, sans-serif; background: var(--bg); color: var(--text); }
       h1 { margin: 0 0 4px; font-size: 22px; }
       .sub { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+      .titleStack { display: flex; flex-direction: column; gap: 8px; }
+      .killSwitchBtn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px;
+        border-radius: 8px;
+        border: 1px solid #6b1f2a;
+        background: linear-gradient(180deg, #2b0f16, #1c0a10);
+        color: #ffdbe2;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .killSwitchBtn:hover { filter: brightness(1.12); }
+      .killStatus { color: var(--muted); font-size: 12px; margin-top: 4px; min-height: 16px; }
+      .dotSkull { width: 28px; height: 28px; }
+      .dotSkull circle { fill: #ffdbe2; }
       .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 12px; }
       .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
       .k { color: var(--muted); font-size: 11px; text-transform: uppercase; }
@@ -332,8 +390,28 @@ LIVE_HTML = """
   <body>
     <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
       <div>
-        <h1>RevenueGenerator Live Split View</h1>
-        <p class="sub">Auto-refresh every 5s. Chart shows last 60 minutes (1-min points, ET).</p>
+        <div class="titleStack">
+          <h1>RevenueGenerator Live Split View</h1>
+          <button class="killSwitchBtn" onclick="triggerKillSwitch()">
+            <svg class="dotSkull" viewBox="0 0 28 28" aria-hidden="true">
+              <!-- dot-matrix skull -->
+              <circle cx="9" cy="6" r="1.1"/><circle cx="11.5" cy="5" r="1.1"/><circle cx="14" cy="4.5" r="1.1"/><circle cx="16.5" cy="5" r="1.1"/><circle cx="19" cy="6" r="1.1"/>
+              <circle cx="7.5" cy="8.5" r="1.1"/><circle cx="10" cy="8" r="1.1"/><circle cx="12.5" cy="7.7" r="1.1"/><circle cx="15.5" cy="7.7" r="1.1"/><circle cx="18" cy="8" r="1.1"/><circle cx="20.5" cy="8.5" r="1.1"/>
+              <circle cx="7" cy="11" r="1.1"/><circle cx="10" cy="11.5" r="1.1"/><circle cx="18" cy="11.5" r="1.1"/><circle cx="21" cy="11" r="1.1"/>
+              <circle cx="8.5" cy="14" r="1.1"/><circle cx="11.5" cy="14.5" r="1.1"/><circle cx="14" cy="15" r="1.1"/><circle cx="16.5" cy="14.5" r="1.1"/><circle cx="19.5" cy="14" r="1.1"/>
+              <circle cx="11.5" cy="18" r="1.1"/><circle cx="14" cy="18.4" r="1.1"/><circle cx="16.5" cy="18" r="1.1"/>
+              <circle cx="12.5" cy="20.7" r="1.0"/><circle cx="15.5" cy="20.7" r="1.0"/>
+              <!-- crossbones -->
+              <circle cx="6.2" cy="21.8" r="1.0"/><circle cx="8.0" cy="23.0" r="1.0"/><circle cx="9.8" cy="24.2" r="1.0"/><circle cx="11.6" cy="25.4" r="1.0"/>
+              <circle cx="6.1" cy="25.5" r="1.0"/><circle cx="8.1" cy="24.2" r="1.0"/><circle cx="10.1" cy="22.9" r="1.0"/><circle cx="12.1" cy="21.6" r="1.0"/>
+              <circle cx="16.4" cy="25.4" r="1.0"/><circle cx="18.2" cy="24.2" r="1.0"/><circle cx="20.0" cy="23.0" r="1.0"/><circle cx="21.8" cy="21.8" r="1.0"/>
+              <circle cx="15.9" cy="21.6" r="1.0"/><circle cx="17.9" cy="22.9" r="1.0"/><circle cx="19.9" cy="24.2" r="1.0"/><circle cx="21.9" cy="25.5" r="1.0"/>
+            </svg>
+            Kill Scheduler
+          </button>
+          <div id="killStatus" class="killStatus"></div>
+          <p class="sub">Auto-refresh every 5s. Chart shows last 60 minutes (1-min points, ET).</p>
+        </div>
       </div>
       <div class="card" style="min-width:360px; margin-bottom:12px;">
         <div class="k">Reserve Controls</div>
@@ -521,6 +599,21 @@ LIVE_HTML = """
         await refresh();
       }
 
+      async function triggerKillSwitch() {
+        const killStatus = document.getElementById("killStatus");
+        killStatus.textContent = "KILL command sent...";
+        const resp = await fetch("/api/live-dashboard/kill-switch", { method: "POST" });
+        const data = await resp.json();
+        if (data.ok) {
+          const list = Array.isArray(data.killed) ? data.killed.join(", ") : "";
+          killStatus.textContent = data.count > 0
+            ? `Scheduler stopped. Killed PID(s): ${list}`
+            : "No running scheduler process found.";
+        } else {
+          killStatus.textContent = `Kill switch failed: ${data.error || "unknown error"}`;
+        }
+      }
+
       async function refresh() {
         const resp = await fetch("/api/live-dashboard");
         const data = await resp.json();
@@ -585,6 +678,12 @@ def api_set_reserve_target():
 def api_recirculate_reserve():
     state = reserve_store.recirculate()
     return jsonify({"ok": True, "reserve_state": state})
+
+
+@app.post("/api/live-dashboard/kill-switch")
+def api_kill_switch():
+    result = _kill_scheduler_processes()
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 if __name__ == "__main__":

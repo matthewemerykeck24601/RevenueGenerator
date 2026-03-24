@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
+
+import requests
 
 from .alpaca_client import AlpacaClient
 from .bot import SEGMENT_UNIVERSE, run_once
+from .equity_mode import apply_equity_mode_switch
 
 
 @dataclass
@@ -54,6 +57,37 @@ def _best_rule_prefilter_score(candidates: list[dict[str, Any]]) -> float:
         if score > best:
             best = score
     return best
+
+
+def _log_ai_call(
+    *,
+    provider: str,
+    model: str,
+    segment: str,
+    budget: float,
+    prompt: str,
+    status: str,
+    response_text: str = "",
+    error: str = "",
+    elapsed_ms: int | None = None,
+) -> None:
+    path = Path("logs") / "ai_calls.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "provider": provider,
+        "model": model,
+        "segment": segment,
+        "budget": budget,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
+        "prompt": prompt,
+        "response_text": response_text,
+        "error": error,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def fetch_market_context(symbols: list[str], segment: str) -> str:
@@ -112,7 +146,7 @@ def fetch_market_context(symbols: list[str], segment: str) -> str:
     return "\n".join(lines)
 
 
-def build_openclaw_prompt(
+def build_ai_prompt(
     *,
     segment: str,
     budget: float,
@@ -183,7 +217,7 @@ Schema (exact):
 """.strip()
 
 
-def run_openclaw_analysis(
+def run_ai_analysis(
     *,
     segment: str,
     budget: float,
@@ -193,7 +227,8 @@ def run_openclaw_analysis(
     rule_based_signals: list[dict[str, Any]] | None = None,
     market_context: str = "",
 ) -> dict[str, Any]:
-    prompt = build_openclaw_prompt(
+    started = datetime.now(timezone.utc)
+    prompt = build_ai_prompt(
         segment=segment,
         budget=budget,
         allowed_symbols=allowed_symbols,
@@ -201,48 +236,105 @@ def run_openclaw_analysis(
         rule_based_signals=rule_based_signals,
         market_context=market_context,
     )
-    openclaw_bin = shutil.which("openclaw")
-    if not openclaw_bin:
-        fallback = os.path.expanduser(r"~\AppData\Roaming\npm\openclaw.cmd")
-        openclaw_bin = fallback if os.path.exists(fallback) else "openclaw"
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    cmd = [
-        openclaw_bin,
-        "agent",
-        "--local",
-        "--agent",
-        "main",
-        "--message",
-        prompt,
-        "--json",
-    ]
-    if os.name == "nt":
-        command_str = subprocess.list2cmdline(cmd)
-        proc = subprocess.run(
-            command_str,
-            capture_output=True,
-            text=True,
-            check=False,
-            shell=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(5, timeout_seconds),
-        )
-    else:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(5, timeout_seconds),
-        )
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
-    if proc.returncode != 0:
-        raise RuntimeError(stderr.strip() or stdout.strip() or "openclaw agent failed")
-    return _extract_json_object(stdout)
+    if anthropic_key:
+        provider = "anthropic"
+        model = os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": anthropic_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 900,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(5, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", [])
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+            response_text = "\n".join([t for t in text_parts if t]).strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=segment,
+                budget=budget,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+            )
+            return _extract_json_object(response_text)
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=segment,
+                budget=budget,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+            )
+            raise RuntimeError(f"anthropic call failed: {err}") from err
+
+    if openai_key:
+        provider = "openai"
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(5, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices", [])
+            response_text = ""
+            if choices:
+                response_text = str(((choices[0] or {}).get("message") or {}).get("content") or "").strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=segment,
+                budget=budget,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+            )
+            return _extract_json_object(response_text)
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=segment,
+                budget=budget,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+            )
+            raise RuntimeError(f"openai call failed: {err}") from err
+
+    raise RuntimeError("No AI provider key configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env.")
 
 
 def validate_and_plan_signal(
@@ -339,11 +431,16 @@ def validate_and_plan_signal(
 
     raw_qty = alloc / latest_price
     is_crypto = "/" in symbol
+    allow_fractional_stocks = bool(risk_policy.get("allowFractionalStocks", True))
     qty: float | int
     if is_crypto:
         qty = round(raw_qty, 6)
         if qty <= 0:
             return AiSignalDecision(False, "Calculated crypto quantity is zero.", normalized, None)
+    elif allow_fractional_stocks:
+        qty = round(raw_qty, 6)
+        if qty <= 0:
+            return AiSignalDecision(False, "Calculated stock fractional quantity is zero.", normalized, None)
     else:
         qty = int(raw_qty)
         if qty < 1:
@@ -373,8 +470,10 @@ def run_ai_cycle(
     budget: float,
     execute: bool,
 ) -> dict[str, Any]:
+    account_snapshot = client.get_account()
+    equity_mode = apply_equity_mode_switch(risk_policy, account=account_snapshot)
     ai_cfg = risk_policy.get("aiScheduler", {})
-    timeout_seconds = int(ai_cfg.get("openclawTimeoutSeconds", 35))
+    timeout_seconds = int(ai_cfg.get("aiTimeoutSeconds", ai_cfg.get("openclawTimeoutSeconds", 35)))
     segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
     allowed_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
     min_budget = float(ai_cfg.get("minBudgetUsd", 25.0))
@@ -385,6 +484,7 @@ def run_ai_cycle(
             "execute": execute,
             "ai_used": False,
             "reason": f"Budget below AI min threshold ({min_budget}).",
+            "equity_mode": equity_mode,
         }
     if not allowed_symbols:
         return {
@@ -393,6 +493,7 @@ def run_ai_cycle(
             "execute": execute,
             "ai_used": False,
             "reason": "No symbols configured for segment.",
+            "equity_mode": equity_mode,
         }
 
     # Optional pre-run cleanup to avoid cash lockup from stale buy orders.
@@ -473,7 +574,7 @@ def run_ai_cycle(
         preview["ai_skipped_reason"] = "prefilter_below_threshold"
         return preview
 
-    signal = run_openclaw_analysis(
+    signal = run_ai_analysis(
         segment=segment,
         budget=budget,
         allowed_symbols=allowed_symbols,
@@ -482,7 +583,7 @@ def run_ai_cycle(
         rule_based_signals=rule_based_signals,
         market_context=market_context,
     )
-    account = client.get_account()
+    account = account_snapshot
     positions = client.get_open_positions()
     decision = validate_and_plan_signal(
         signal=signal,
@@ -524,5 +625,6 @@ def run_ai_cycle(
         "orders_planned": [decision.planned_order] if decision.planned_order else [],
         "orders_placed": [placed] if placed else [],
         "order_errors": ([{"symbol": decision.planned_order.get("symbol"), "error": place_error}] if place_error and decision.planned_order else []),
+        "equity_mode": equity_mode,
     }
 
