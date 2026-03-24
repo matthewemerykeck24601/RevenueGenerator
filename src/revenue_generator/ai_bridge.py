@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .alpaca_client import AlpacaClient
@@ -54,6 +54,59 @@ def _best_rule_prefilter_score(candidates: list[dict[str, Any]]) -> float:
         if score > best:
             best = score
     return best
+
+
+def fetch_market_context(symbols: list[str], segment: str) -> str:
+    """Fetch recent price/volume context for AI prompt enrichment using yfinance."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return ""
+
+    lines: list[str] = []
+    lines.append(f"Live market snapshot ({date.today().isoformat()}) for {segment}:")
+
+    # Map crypto to Yahoo format
+    yahoo_map = {
+        "BTC/USD": "BTC-USD",
+        "ETH/USD": "ETH-USD",
+        "SOL/USD": "SOL-USD",
+        "AVAX/USD": "AVAX-USD",
+        "LTC/USD": "LTC-USD",
+        "LINK/USD": "LINK-USD",
+    }
+
+    summary_rows: list[str] = []
+    for sym in symbols[:8]:  # cap to avoid slow calls
+        yahoo_sym = yahoo_map.get(sym, sym)
+        try:
+            ticker = yf.Ticker(yahoo_sym)
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+            if hist is None or len(hist) < 2:
+                continue
+            closes = hist["Close"].dropna().tolist()
+            vols = hist["Volume"].fillna(0).tolist()
+            if len(closes) < 2:
+                continue
+            last = closes[-1]
+            prev = closes[-2]
+            ret_1d = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+            ret_5d = ((last - closes[0]) / closes[0] * 100.0) if closes[0] > 0 else 0.0
+            vol_today = vols[-1] if vols else 0
+            vol_avg = sum(vols) / len(vols) if vols else 1
+            vol_ratio = vol_today / max(vol_avg, 1)
+            summary_rows.append(
+                f"  {sym}: price={last:.4f}, 1d={ret_1d:+.2f}%, 5d={ret_5d:+.2f}%, vol_ratio={vol_ratio:.2f}x"
+            )
+        except Exception:
+            continue
+
+    if not summary_rows:
+        return ""
+
+    lines.extend(summary_rows)
+    lines.append("Use this data to assess momentum quality before deciding.")
+    return "\n".join(lines)
 
 
 def build_openclaw_prompt(
@@ -390,7 +443,7 @@ def run_ai_cycle(
         market_context = (
             f"Rule engine context: universe_size={preview.get('universe_size', 0)}, "
             f"symbols_with_data={preview.get('symbols_with_data', 0)}, "
-            f"signals_considered={preview.get('signals_considered', 0)}."
+            f"signals_considered={preview.get('signals_considered', 0)}.\n" + fetch_market_context(allowed_symbols, segment)
         )
     except Exception:
         rule_based_signals = []

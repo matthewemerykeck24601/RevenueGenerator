@@ -2,18 +2,18 @@
   "version": "1.0.0",
   "maxDailyLossPct": 3.0,
   "maxDrawdownPct": 10.0,
-  "maxPositionSizePct": 8.0,
-  "maxOpenPositions": 15,
-  "buyCooldownMinutes": 25,
+  "maxPositionSizePct": 6.0,
+  "maxOpenPositions": 10,
+  "buyCooldownMinutes": 20,
   "allowAddOnBuys": true,
-  "maxEntriesPerSymbol": 4,
-  "addOnBuyCooldownMinutes": 8,
+  "maxEntriesPerSymbol": 2,
+  "addOnBuyCooldownMinutes": 12,
   "entryCountLookbackHours": 48,
   "cancelOpenOrdersBeforeRun": true,
-  "cancelOpenOrdersAfterMinutes": 20,
+  "cancelOpenOrdersAfterMinutes": 15,
   "equityBracketsEnabled": false,
-  "minSignalConfidence": 0.65,
-  "minExpectedEdge": 0.05,
+  "minSignalConfidence": 0.6,
+  "minExpectedEdge": 0.04,
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 20,
@@ -25,18 +25,18 @@
   "aiScheduler": {
     "enabled": true,
     "segments": [
-      "pennyStocks",
-      "crypto",
-      "indexFunds"
+      "indexFunds",
+      "largeCapStocks",
+      "crypto"
     ],
     "fallbackToRuleEngine": true,
-    "openclawTimeoutSeconds": 35,
-    "prefilterScoreThreshold": 0.6,
-    "minBudgetUsd": 25,
-    "minConfidenceForBuy": 0.7,
-    "minExpectedEdgeForBuy": 0.05,
-    "slippageBufferBpsStocks": 6,
-    "slippageBufferBpsCrypto": 12,
+    "openclawTimeoutSeconds": 45,
+    "prefilterScoreThreshold": 0.035,
+    "minBudgetUsd": 50,
+    "minConfidenceForBuy": 0.65,
+    "minExpectedEdgeForBuy": 0.04,
+    "slippageBufferBpsStocks": 5,
+    "slippageBufferBpsCrypto": 10,
     "marketHoursOnly": true,
     "timezone": "America/New_York",
     "marketOpen": "09:30",
@@ -50,20 +50,25 @@
     ]
   },
   "sectorCadence": {
-    "pennyStocks": {
+    "indexFunds": {
       "enabled": true,
-      "intervalSeconds": 120,
-      "budgetPct": 65
+      "intervalSeconds": 300,
+      "budgetPct": 45
+    },
+    "largeCapStocks": {
+      "enabled": true,
+      "intervalSeconds": 420,
+      "budgetPct": 35
     },
     "crypto": {
       "enabled": true,
-      "intervalSeconds": 420,
+      "intervalSeconds": 600,
       "budgetPct": 15
     },
-    "indexFunds": {
-      "enabled": true,
-      "intervalSeconds": 900,
-      "budgetPct": 20
+    "pennyStocks": {
+      "enabled": false,
+      "intervalSeconds": 120,
+      "budgetPct": 5
     }
   },
   "takeProfitPct": 4.5,
@@ -86,7 +91,7 @@
       ]
     },
     "pennyStocks": {
-      "enabled": true,
+      "enabled": false,
       "maxSpreadBps": 90,
       "maxSignals": 6,
       "minDollarVolume": 3000000,
@@ -117,13 +122,19 @@
         "AAPL",
         "AMZN",
         "GOOGL",
-        "META"
+        "META",
+        "TSLA",
+        "AVGO",
+        "AMD",
+        "CRM",
+        "NFLX",
+        "ORCL"
       ]
     },
     "indexFunds": {
       "enabled": true,
-      "maxSpreadBps": 12,
-      "maxSignals": 1,
+      "maxSpreadBps": 15,
+      "maxSignals": 2,
       "symbolsAllowlist": [
         "SPY",
         "QQQ",
@@ -162,13 +173,13 @@
     "nearLimitBuffer": 1
   },
   "exitHooks": {
-    "firstTargetPct": 3.0,
-    "firstTargetSellPct": 40.0,
-    "secondTargetPct": 6.0,
-    "secondTargetSellPct": 30.0,
-    "trailingStopPct": 1.8,
-    "breakEvenBufferPct": 0.15,
-    "hardStopLossPct": 2.4,
+    "firstTargetPct": 2.5,
+    "firstTargetSellPct": 50.0,
+    "secondTargetPct": 5.0,
+    "secondTargetSellPct": 35.0,
+    "trailingStopPct": 1.5,
+    "breakEvenBufferPct": 0.2,
+    "hardStopLossPct": 1.8,
     "minNotionalExitUsd": 5.0
   }
 }

@@ -206,6 +206,8 @@ def run_once(
 
     if segment == "crypto":
         bars = client.get_crypto_bars(universe, timeframe="1Hour", limit=80)
+    elif segment in ("largeCapStocks", "indexFunds"):
+        bars = client.get_stock_bars(universe, timeframe="1Day", limit=40)
     else:
         snapshots = client.get_stock_snapshots(universe)
         bars = _bars_from_stock_snapshots(snapshots)

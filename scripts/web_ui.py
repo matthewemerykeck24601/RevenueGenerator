@@ -69,18 +69,24 @@ class ReserveStateStore:
         self._state["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.path.write_text(json.dumps(self._state, indent=2) + "\n", encoding="utf-8")
 
+    def _refresh(self) -> None:
+        self._state = self._load()
+
     def set_target(self, target_amount: float) -> dict[str, object]:
+        self._refresh()
         self._state["reserve_target_request"] = max(target_amount, 0.0)
         self._save()
         return dict(self._state)
 
     def recirculate(self) -> dict[str, object]:
+        self._refresh()
         self._state["reserve_balance"] = 0.0
         self._state["reserve_target_request"] = 0.0
         self._save()
         return dict(self._state)
 
     def sync_with_cash(self, cash: float) -> dict[str, object]:
+        self._refresh()
         changed = False
         reserve_balance = max(_to_float(self._state.get("reserve_balance")), 0.0)
         reserve_target_request = max(_to_float(self._state.get("reserve_target_request")), 0.0)
