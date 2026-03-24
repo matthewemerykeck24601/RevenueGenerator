@@ -16,11 +16,12 @@
     "enabled": true,
     "segments": [
       "pennyStocks",
+      "crypto",
       "indexFunds"
     ],
     "fallbackToRuleEngine": true,
     "openclawTimeoutSeconds": 35,
-    "prefilterScoreThreshold": 0.035,
+    "prefilterScoreThreshold": 0.6,
     "minBudgetUsd": 25,
     "minConfidenceForBuy": 0.7,
     "minExpectedEdgeForBuy": 0.05,
