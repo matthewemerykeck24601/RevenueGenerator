@@ -19,7 +19,8 @@ from revenue_generator.scheduler import BotScheduler, RunnerConfig
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run recurring paper-trading scheduler.")
     p.add_argument("--segment", required=True, choices=["largeCapStocks", "pennyStocks", "crypto", "indexFunds"])
-    p.add_argument("--budget", required=True, type=float)
+    p.add_argument("--budget", type=float, default=0.0, help="Fixed budget USD (required when --budget-mode fixed).")
+    p.add_argument("--budget-mode", choices=["dynamic", "fixed"], default="dynamic")
     p.add_argument("--interval", default=300, type=int, help="Seconds between runs.")
     p.add_argument("--execute", action="store_true", help="Actually place paper orders.")
     return p.parse_args()
@@ -27,6 +28,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.budget_mode == "fixed" and args.budget <= 0:
+        raise SystemExit("--budget must be > 0 when --budget-mode fixed")
     cfg = build_runtime_config()
     policy = ensure_risk_policy()
     client = AlpacaClient(cfg=cfg)
@@ -35,9 +38,10 @@ def main() -> int:
 
     run_cfg = RunnerConfig(
         segment=args.segment,
-        budget=args.budget,
         execute=args.execute,
         interval_seconds=args.interval,
+        budget=args.budget,
+        budget_mode=args.budget_mode,
     )
     scheduler.start(run_cfg)
     print("Scheduler started. Press Ctrl+C to stop.")

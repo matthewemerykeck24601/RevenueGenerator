@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
@@ -25,8 +26,108 @@ client = AlpacaClient(cfg=cfg)
 journal = TradeJournal()
 scheduler = BotScheduler(client=client, risk_policy=policy, journal=journal)
 exit_manager = ExitManager(client=client, risk_policy=policy, journal=journal)
+reserve_state_path = ROOT / "logs" / "reserve_state.json"
 last_exit_result = {"message": "No exit checks run yet."}
 last_ai_result = {"message": "No AI analysis run yet."}
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class ReserveStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._state = self._load()
+
+    def _load(self) -> dict[str, object]:
+        if not self.path.exists():
+            return {
+                "reserve_balance": 0.0,
+                "reserve_target_request": 0.0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            return {
+                "reserve_balance": max(_to_float(raw.get("reserve_balance")), 0.0),
+                "reserve_target_request": max(_to_float(raw.get("reserve_target_request")), 0.0),
+                "updated_at": str(raw.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            }
+        except Exception:
+            return {
+                "reserve_balance": 0.0,
+                "reserve_target_request": 0.0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def _save(self) -> None:
+        self._state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.path.write_text(json.dumps(self._state, indent=2) + "\n", encoding="utf-8")
+
+    def set_target(self, target_amount: float) -> dict[str, object]:
+        self._state["reserve_target_request"] = max(target_amount, 0.0)
+        self._save()
+        return dict(self._state)
+
+    def recirculate(self) -> dict[str, object]:
+        self._state["reserve_balance"] = 0.0
+        self._state["reserve_target_request"] = 0.0
+        self._save()
+        return dict(self._state)
+
+    def sync_with_cash(self, cash: float) -> dict[str, object]:
+        changed = False
+        reserve_balance = max(_to_float(self._state.get("reserve_balance")), 0.0)
+        reserve_target_request = max(_to_float(self._state.get("reserve_target_request")), 0.0)
+
+        bounded_balance = min(reserve_balance, max(cash, 0.0))
+        if bounded_balance != reserve_balance:
+            reserve_balance = bounded_balance
+            changed = True
+
+        if reserve_target_request > reserve_balance:
+            free_cash = max(cash - reserve_balance, 0.0)
+            fill = min(reserve_target_request - reserve_balance, free_cash)
+            if fill > 0:
+                reserve_balance += fill
+                changed = True
+            if reserve_balance >= reserve_target_request:
+                reserve_target_request = 0.0
+                changed = True
+
+        self._state["reserve_balance"] = round(reserve_balance, 6)
+        self._state["reserve_target_request"] = round(reserve_target_request, 6)
+        if changed:
+            self._save()
+        return dict(self._state)
+
+
+reserve_store = ReserveStateStore(reserve_state_path)
+
+
+def _build_reserve_snapshot() -> dict[str, object]:
+    try:
+        account = client.get_account()
+        cash = max(_to_float(account.get("cash")), 0.0)
+        equity = max(_to_float(account.get("equity")), 0.0)
+    except Exception:
+        cash = 0.0
+        equity = 0.0
+    state = reserve_store.sync_with_cash(cash=cash)
+    reserve_balance = _to_float(state.get("reserve_balance"))
+    return {
+        "cash": cash,
+        "equity": equity,
+        "reserve_balance": reserve_balance,
+        "reserve_target_request": _to_float(state.get("reserve_target_request")),
+        "deployable_cash": max(cash - reserve_balance, 0.0),
+        "deployable_equity": max(equity - reserve_balance, 0.0),
+    }
 
 
 HTML = """
@@ -59,15 +160,32 @@ HTML = """
         </select>
         <label>Budget (USD)</label>
         <input name="budget" type="number" step="0.01" value="2000" />
+        <label>Budget Mode</label>
+        <select name="budget_mode">
+          <option value="dynamic" selected>dynamic (cash - reserves)</option>
+          <option value="fixed">fixed (manual budget input)</option>
+        </select>
         <label>Interval seconds</label>
         <input name="interval" type="number" value="300" />
         <label><input type="checkbox" name="execute" value="1" /> Execute real paper orders</label>
       </fieldset>
       <button type="submit">Start Scheduler</button>
     </form>
+    <form method="post" action="{{ url_for('set_reserve') }}">
+      <fieldset>
+        <legend>Reserve Controls</legend>
+        <label>Reserve Request (USD)</label>
+        <input name="reserve_target" type="number" step="0.01" min="0" value="0" />
+      </fieldset>
+      <button type="submit">Set Reserve Request</button>
+    </form>
+    <form method="post" action="{{ url_for('recirculate_reserve') }}" style="display:inline-block;">
+      <button type="submit">Recirculate Reserves</button>
+    </form>
     <form method="post" action="{{ url_for('run_now') }}" style="display:inline-block;">
       <input type="hidden" name="segment" value="largeCapStocks" />
-      <input type="hidden" name="budget" value="2000" />
+      <input type="hidden" name="budget_mode" value="dynamic" />
+      <input type="hidden" name="budget" value="0" />
       <button type="submit">Run Once (Dry)</button>
     </form>
     <form method="post" action="{{ url_for('stop') }}" style="display:inline-block;">
@@ -83,6 +201,8 @@ HTML = """
     </div>
     <h2>Status</h2>
     <pre>{{ status_json }}</pre>
+    <h2>Reserve Snapshot</h2>
+    <pre>{{ reserve_json }}</pre>
     <h2>Last Exit Check</h2>
     <pre>{{ exit_status_json }}</pre>
     <h2>Last AI Result</h2>
@@ -97,6 +217,7 @@ def index():
     return render_template_string(
         HTML,
         status_json=json.dumps(scheduler.status(), indent=2),
+        reserve_json=json.dumps(_build_reserve_snapshot(), indent=2),
         exit_status_json=json.dumps(last_exit_result, indent=2),
         ai_status_json=json.dumps(last_ai_result, indent=2),
     )
@@ -105,14 +226,17 @@ def index():
 @app.post("/start")
 def start():
     segment = request.form.get("segment", "largeCapStocks")
-    budget = float(request.form.get("budget", "2000"))
+    budget_mode = str(request.form.get("budget_mode", "dynamic")).lower()
+    budget_default = "2000" if budget_mode == "fixed" else "0"
+    budget = float(request.form.get("budget", budget_default))
     interval = int(request.form.get("interval", "300"))
     execute = request.form.get("execute") == "1"
     cfg_obj = RunnerConfig(
         segment=segment,
-        budget=budget,
-        interval_seconds=interval,
         execute=execute,
+        interval_seconds=interval,
+        budget=budget,
+        budget_mode=budget_mode,
     )
     try:
         scheduler.start(cfg_obj)
@@ -127,11 +251,26 @@ def stop():
     return redirect(url_for("index"))
 
 
+@app.post("/reserve/set")
+def set_reserve():
+    target = max(_to_float(request.form.get("reserve_target", "0")), 0.0)
+    reserve_store.set_target(target)
+    return redirect(url_for("index"))
+
+
+@app.post("/reserve/recirculate")
+def recirculate_reserve():
+    reserve_store.recirculate()
+    return redirect(url_for("index"))
+
+
 @app.post("/run-now")
 def run_now():
     segment = request.form.get("segment", "largeCapStocks")
-    budget = float(request.form.get("budget", "2000"))
-    cfg_obj = RunnerConfig(segment=segment, budget=budget, interval_seconds=300, execute=False)
+    budget_mode = str(request.form.get("budget_mode", "dynamic")).lower()
+    budget_default = "2000" if budget_mode == "fixed" else "0"
+    budget = float(request.form.get("budget", budget_default))
+    cfg_obj = RunnerConfig(segment=segment, execute=False, interval_seconds=300, budget=budget, budget_mode=budget_mode)
     scheduler.run_once_now(cfg_obj)
     return redirect(url_for("index"))
 

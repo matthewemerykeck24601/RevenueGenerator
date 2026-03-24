@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .alpaca_client import AlpacaClient
-from .external_research import select_external_candidates
+from .external_research import select_external_candidates, should_skip_cycle_for_vix
 from .risk import evaluate_risk
 from .strategy import Signal, select_top_signals
 
@@ -140,6 +140,29 @@ def run_once(
 
     universe = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE[segment]
     external_cfg = risk_policy.get("externalResearch", {})
+    if external_cfg.get("enabled", True):
+        regime_vix_ceiling = float(external_cfg.get("riskOffVixCeiling", 25.0))
+        risk_off_segments = external_cfg.get("riskOffSegments", ["pennyStocks"])
+        skip_for_vix, vix_now = should_skip_cycle_for_vix(
+            segment=segment,
+            risk_off_vix_ceiling=regime_vix_ceiling,
+            risk_off_segments=[str(s) for s in risk_off_segments],
+        )
+        if skip_for_vix:
+            return {
+                "strategy": "rule_engine",
+                "account_status": account.get("status"),
+                "segment": segment,
+                "budget": budget,
+                "execute": execute,
+                "vix_risk_off_skip": True,
+                "vix_value": vix_now,
+                "vix_ceiling": regime_vix_ceiling,
+                "reason": f"Skipped cycle due to elevated VIX ({vix_now:.2f} > {regime_vix_ceiling:.2f}).",
+                "orders_planned": [],
+                "orders_placed": [],
+                "order_errors": [],
+            }
     if external_cfg.get("enabled", True):
         top_n = int(external_cfg.get("topCandidatesPerSegment", 12))
         regime_vix_ceiling = float(external_cfg.get("riskOffVixCeiling", 25.0))

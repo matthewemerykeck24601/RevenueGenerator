@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -19,6 +19,7 @@ from revenue_generator.config import build_runtime_config
 app = Flask(__name__)
 cfg = build_runtime_config()
 client = AlpacaClient(cfg=cfg)
+RESERVE_STATE_PATH = ROOT / "logs" / "reserve_state.json"
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -26,6 +27,81 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+class ReserveStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._state = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {
+                "reserve_balance": 0.0,
+                "reserve_target_request": 0.0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            return {
+                "reserve_balance": max(_to_float(raw.get("reserve_balance")), 0.0),
+                "reserve_target_request": max(_to_float(raw.get("reserve_target_request")), 0.0),
+                "updated_at": str(raw.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            }
+        except Exception:
+            return {
+                "reserve_balance": 0.0,
+                "reserve_target_request": 0.0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def _save(self) -> None:
+        self._state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.path.write_text(json.dumps(self._state, indent=2) + "\n", encoding="utf-8")
+
+    def set_target(self, target_amount: float) -> dict[str, Any]:
+        self._state["reserve_target_request"] = max(target_amount, 0.0)
+        self._save()
+        return dict(self._state)
+
+    def recirculate(self) -> dict[str, Any]:
+        # Release all reserved cash back to deployable capital.
+        self._state["reserve_balance"] = 0.0
+        self._state["reserve_target_request"] = 0.0
+        self._save()
+        return dict(self._state)
+
+    def sync_with_cash(self, cash: float) -> dict[str, Any]:
+        changed = False
+        reserve_balance = max(_to_float(self._state.get("reserve_balance")), 0.0)
+        reserve_target_request = max(_to_float(self._state.get("reserve_target_request")), 0.0)
+
+        # Keep reserve bounded by real available cash in account.
+        bounded_balance = min(reserve_balance, max(cash, 0.0))
+        if bounded_balance != reserve_balance:
+            reserve_balance = bounded_balance
+            changed = True
+
+        # Fill reserve request only from currently unreserved cash.
+        if reserve_target_request > reserve_balance:
+            free_cash = max(cash - reserve_balance, 0.0)
+            fill = min(reserve_target_request - reserve_balance, free_cash)
+            if fill > 0:
+                reserve_balance += fill
+                changed = True
+            if reserve_balance >= reserve_target_request:
+                reserve_target_request = 0.0
+                changed = True
+
+        self._state["reserve_balance"] = round(reserve_balance, 6)
+        self._state["reserve_target_request"] = round(reserve_target_request, 6)
+        if changed:
+            self._save()
+        return dict(self._state)
+
+
+reserve_store = ReserveStateStore(RESERVE_STATE_PATH)
 
 
 def _build_dashboard_payload() -> dict[str, Any]:
@@ -42,8 +118,12 @@ def _build_dashboard_payload() -> dict[str, Any]:
         day_start_equity = equity
     day_pnl = equity - day_start_equity
     day_pnl_pct = (day_pnl / day_start_equity * 100.0) if day_start_equity else 0.0
-    # Working budget = funded principal +/- realized/unrealized P/L, which is current equity.
-    working_budget = equity
+    reserve_state = reserve_store.sync_with_cash(cash=cash)
+    reserve_balance = _to_float(reserve_state.get("reserve_balance"))
+    reserve_target_request = _to_float(reserve_state.get("reserve_target_request"))
+    # Deployable budget = current equity minus reserved cash.
+    working_budget = max(equity - reserve_balance, 0.0)
+    deployable_cash = max(cash - reserve_balance, 0.0)
 
     open_positions: list[dict[str, Any]] = []
     total_market_value = 0.0
@@ -67,7 +147,7 @@ def _build_dashboard_payload() -> dict[str, Any]:
         total_market_value += market_value
         total_unrealized_pl += unrealized_pl
 
-    recent_fills: list[dict[str, Any]] = []
+    filled_orders: list[dict[str, Any]] = []
     for o in orders:
         status = str(o.get("status", ""))
         filled_at = o.get("filled_at")
@@ -75,7 +155,7 @@ def _build_dashboard_payload() -> dict[str, Any]:
         filled_avg_price = _to_float(o.get("filled_avg_price"))
         if status not in {"filled", "partially_filled"} or not filled_at or filled_qty <= 0:
             continue
-        recent_fills.append(
+        filled_orders.append(
             {
                 "filled_at": filled_at,
                 "symbol": o.get("symbol"),
@@ -86,6 +166,52 @@ def _build_dashboard_payload() -> dict[str, Any]:
                 "status": status,
             }
         )
+    # Build realized win-rate telemetry on sell fills using FIFO matched buy costs.
+    fifo_costs: dict[str, list[tuple[float, float]]] = {}
+    sell_trades_evaluated = 0
+    sell_wins = 0
+    for fill in sorted(filled_orders, key=lambda r: r["filled_at"]):
+        symbol = str(fill.get("symbol") or "")
+        side = str(fill.get("side") or "").lower()
+        qty = _to_float(fill.get("qty"))
+        price = _to_float(fill.get("price"))
+        if not symbol or qty <= 0 or price <= 0:
+            continue
+
+        if side == "buy":
+            fifo_costs.setdefault(symbol, []).append((qty, price))
+            continue
+        if side != "sell":
+            continue
+
+        remaining = qty
+        consumed_cost = 0.0
+        consumed_qty = 0.0
+        lots = fifo_costs.setdefault(symbol, [])
+        while remaining > 0 and lots:
+            lot_qty, lot_price = lots[0]
+            take = min(remaining, lot_qty)
+            consumed_cost += take * lot_price
+            consumed_qty += take
+            remaining -= take
+            lot_qty -= take
+            if lot_qty <= 1e-9:
+                lots.pop(0)
+            else:
+                lots[0] = (lot_qty, lot_price)
+        if consumed_qty <= 0:
+            continue
+
+        avg_cost = consumed_cost / consumed_qty
+        realized_pl_pct = ((price - avg_cost) / avg_cost * 100.0) if avg_cost > 0 else 0.0
+        fill["realized_pl_pct"] = realized_pl_pct
+        sell_trades_evaluated += 1
+        if realized_pl_pct > 0:
+            sell_wins += 1
+
+    sell_win_rate_pct = (sell_wins / sell_trades_evaluated * 100.0) if sell_trades_evaluated > 0 else 0.0
+
+    recent_fills = list(filled_orders)
     recent_fills.sort(key=lambda r: r["filled_at"], reverse=True)
     recent_fills = recent_fills[:40]
 
@@ -124,6 +250,12 @@ def _build_dashboard_payload() -> dict[str, Any]:
             "open_positions_count": len(open_positions),
             "open_positions_market_value": total_market_value,
             "open_positions_unrealized_pl": total_unrealized_pl,
+            "sell_trades_evaluated": sell_trades_evaluated,
+            "sell_wins": sell_wins,
+            "sell_win_rate_pct": sell_win_rate_pct,
+            "reserve_balance": reserve_balance,
+            "reserve_target_request": reserve_target_request,
+            "deployable_cash": deployable_cash,
         },
         "open_positions": open_positions,
         "recent_fills": recent_fills,
@@ -192,13 +324,30 @@ LIVE_HTML = """
     </style>
   </head>
   <body>
-    <h1>RevenueGenerator Live Split View</h1>
-    <p class="sub">Auto-refresh every 5s. Chart shows last 60 minutes (1-min points, ET).</p>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
+      <div>
+        <h1>RevenueGenerator Live Split View</h1>
+        <p class="sub">Auto-refresh every 5s. Chart shows last 60 minutes (1-min points, ET).</p>
+      </div>
+      <div class="card" style="min-width:360px; margin-bottom:12px;">
+        <div class="k">Reserve Controls</div>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <input id="reserveTargetInput" type="number" step="0.01" min="0" placeholder="Reserve request (USD)" style="width:170px; padding:6px;" />
+          <button onclick="setReserveTarget()" style="padding:6px 10px;">Set Reserve Request</button>
+          <button onclick="recirculateReserves()" style="padding:6px 10px;">Recirculate Reserves</button>
+        </div>
+        <div id="reserveStatus" style="margin-top:8px; color:var(--muted); font-size:12px;">Reserve pot: -- | Pending request: --</div>
+      </div>
+    </div>
 
     <div class="cards">
-      <div class="card"><div class="k">Budget (Funded +/- P/L)</div><div class="v" id="budget">$0</div></div>
+      <div class="card"><div class="k">Budget (Deployable Equity)</div><div class="v" id="budget">$0</div></div>
       <div class="card"><div class="k">Balance (Equity)</div><div class="v" id="equity">$0</div></div>
+      <div class="card"><div class="k">Open Positions</div><div class="v" id="openCountTop">0</div></div>
+      <div class="card"><div class="k">Sell Win Rate</div><div class="v" id="sellWinRateTop">0.00%</div></div>
+      <div class="card"><div class="k">Reserve Pot</div><div class="v" id="reserveTop">$0</div></div>
       <div class="card"><div class="k">Cash</div><div class="v" id="cash">$0</div></div>
+      <div class="card"><div class="k">Deployable Cash</div><div class="v" id="deployableCash">$0</div></div>
       <div class="card"><div class="k">Purchases (Open MV)</div><div class="v" id="openMv">$0</div></div>
       <div class="card"><div class="k">Returns (Unrealized)</div><div class="v" id="unrealized">$0</div></div>
       <div class="card"><div class="k">Up / Down Today</div><div class="v" id="dayPnl">$0</div></div>
@@ -349,6 +498,23 @@ LIVE_HTML = """
         document.getElementById("mCashBar").style.width = `${Math.max(0, Math.min(100, cashPct)).toFixed(2)}%`;
       }
 
+      async function setReserveTarget() {
+        const input = document.getElementById("reserveTargetInput");
+        const value = Number(input.value || 0);
+        await fetch("/api/live-dashboard/reserve-target", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target: value }),
+        });
+        input.value = "";
+        await refresh();
+      }
+
+      async function recirculateReserves() {
+        await fetch("/api/live-dashboard/reserve-recirculate", { method: "POST" });
+        await refresh();
+      }
+
       async function refresh() {
         const resp = await fetch("/api/live-dashboard");
         const data = await resp.json();
@@ -356,7 +522,11 @@ LIVE_HTML = """
 
         document.getElementById("budget").textContent = fmt(s.working_budget);
         document.getElementById("equity").textContent = fmt(s.equity);
+        document.getElementById("openCountTop").textContent = String(s.open_positions_count || 0);
+        document.getElementById("sellWinRateTop").textContent = fmtPct(s.sell_win_rate_pct);
+        document.getElementById("reserveTop").textContent = fmt(s.reserve_balance);
         document.getElementById("cash").textContent = fmt(s.cash);
+        document.getElementById("deployableCash").textContent = fmt(s.deployable_cash);
         document.getElementById("openMv").textContent = fmt(s.open_positions_market_value);
         document.getElementById("unrealized").textContent = fmt(s.open_positions_unrealized_pl);
         document.getElementById("dayPnl").textContent = `${fmt(s.day_pnl)} (${fmtPct(s.day_pnl_pct)})`;
@@ -375,6 +545,8 @@ LIVE_HTML = """
         renderPositions(data.open_positions || []);
         renderFills(data.recent_fills || []);
         renderSessionMetrics(data, s);
+        document.getElementById("reserveStatus").textContent =
+          `Reserve pot: ${fmt(s.reserve_balance)} | Pending request: ${fmt(s.reserve_target_request)}`;
       }
 
       refresh();
@@ -393,6 +565,20 @@ def index() -> str:
 @app.get("/api/live-dashboard")
 def api_live_dashboard():
     return jsonify(_build_dashboard_payload())
+
+
+@app.post("/api/live-dashboard/reserve-target")
+def api_set_reserve_target():
+    payload = request.get_json(silent=True) or {}
+    target = max(_to_float(payload.get("target"), 0.0), 0.0)
+    state = reserve_store.set_target(target)
+    return jsonify({"ok": True, "reserve_state": state})
+
+
+@app.post("/api/live-dashboard/reserve-recirculate")
+def api_recirculate_reserve():
+    state = reserve_store.recirculate()
+    return jsonify({"ok": True, "reserve_state": state})
 
 
 if __name__ == "__main__":

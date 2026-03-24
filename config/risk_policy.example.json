@@ -10,7 +10,10 @@
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 10,
-    "riskOffVixCeiling": 25
+    "riskOffVixCeiling": 25,
+    "riskOffSegments": [
+      "pennyStocks"
+    ]
   },
   "aiScheduler": {
     "enabled": true,

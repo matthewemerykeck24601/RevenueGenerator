@@ -66,6 +66,26 @@ def _current_vix() -> float | None:
     return _to_float(closes.iloc[-1], 0.0)
 
 
+def get_current_vix() -> float | None:
+    return _current_vix()
+
+
+def should_skip_cycle_for_vix(
+    *,
+    segment: str,
+    risk_off_vix_ceiling: float,
+    risk_off_segments: list[str],
+    vix_value: float | None = None,
+) -> tuple[bool, float | None]:
+    segment_set = {str(s) for s in risk_off_segments}
+    if segment not in segment_set:
+        return False, vix_value
+    vix = _to_float(vix_value, 0.0) if vix_value is not None else _current_vix()
+    if vix is None:
+        return False, None
+    return vix > float(risk_off_vix_ceiling), vix
+
+
 def select_external_candidates(
     *,
     segment: str,
@@ -75,11 +95,14 @@ def select_external_candidates(
 ) -> list[str]:
     if not symbols:
         return []
-    if segment == "pennyStocks":
-        vix = _current_vix()
-        if vix is not None and vix > regime_vix_ceiling:
-            # Risk-off regime: skip penny candidates until volatility cools.
-            return []
+    skip, _vix = should_skip_cycle_for_vix(
+        segment=segment,
+        risk_off_vix_ceiling=regime_vix_ceiling,
+        risk_off_segments=["pennyStocks"],
+    )
+    if skip:
+        # Risk-off regime: skip penny candidates until volatility cools.
+        return []
     scored: list[tuple[str, float]] = []
     if segment == "crypto":
         for sym in symbols:
