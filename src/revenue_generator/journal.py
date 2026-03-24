@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Any
 
 
+def _to_float(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class TradeJournal:
     def __init__(self, folder: str = "logs") -> None:
         self.folder = Path(folder)
@@ -33,6 +40,9 @@ class TradeJournal:
                         "signals_considered",
                         "orders_planned_count",
                         "orders_placed_count",
+                        "predicted_edge_avg",
+                        "realized_edge_avg",
+                        "edge_error",
                         "notes",
                     ]
                 )
@@ -94,6 +104,9 @@ class TradeJournal:
             self._ensure_column(con, "cycles", "strategy", "TEXT")
             self._ensure_column(con, "cycles", "order_errors_json", "TEXT")
             self._ensure_column(con, "cycles", "raw_result_json", "TEXT")
+            self._ensure_column(con, "cycles", "predicted_edge_avg", "REAL")
+            self._ensure_column(con, "cycles", "realized_edge_avg", "REAL")
+            self._ensure_column(con, "cycles", "edge_error", "REAL")
             con.commit()
         finally:
             con.close()
@@ -114,6 +127,28 @@ class TradeJournal:
         planned = result.get("orders_planned", [])
         placed = result.get("orders_placed", [])
         order_errors = result.get("order_errors", [])
+        predicted_edges = [_to_float(p.get("expected_edge")) for p in planned if isinstance(p, dict)]
+        predicted_edges = [v for v in predicted_edges if v is not None]
+        predicted_edge_avg = (sum(predicted_edges) / len(predicted_edges)) if predicted_edges else None
+
+        realized_edges: list[float] = []
+        for p in placed:
+            if not isinstance(p, dict):
+                continue
+            limit_v = _to_float(p.get("limit_price"))
+            fill_v = _to_float(p.get("filled_avg_price"))
+            side = str(p.get("side", "")).lower()
+            if limit_v is None or fill_v is None or limit_v <= 0:
+                continue
+            if side == "sell":
+                realized_edges.append((fill_v - limit_v) / limit_v)
+            else:
+                realized_edges.append((limit_v - fill_v) / limit_v)
+        realized_edge_avg = (sum(realized_edges) / len(realized_edges)) if realized_edges else None
+        edge_error = None
+        if predicted_edge_avg is not None and realized_edge_avg is not None:
+            edge_error = realized_edge_avg - predicted_edge_avg
+
         strategy = str(
             result.get("strategy")
             or (
@@ -136,6 +171,9 @@ class TradeJournal:
                     signals_considered,
                     len(planned),
                     len(placed),
+                    "" if predicted_edge_avg is None else f"{predicted_edge_avg:.6f}",
+                    "" if realized_edge_avg is None else f"{realized_edge_avg:.6f}",
+                    "" if edge_error is None else f"{edge_error:.6f}",
                     notes,
                 ]
             )
@@ -146,9 +184,10 @@ class TradeJournal:
                 """
                 INSERT INTO cycles (
                     ts, segment, budget, execute, account_status, signals_considered,
-                    orders_planned_json, orders_placed_json, notes, strategy, order_errors_json, raw_result_json
+                    orders_planned_json, orders_placed_json, notes, strategy, order_errors_json, raw_result_json,
+                    predicted_edge_avg, realized_edge_avg, edge_error
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ts,
@@ -163,6 +202,9 @@ class TradeJournal:
                     strategy,
                     json.dumps(order_errors),
                     json.dumps(result),
+                    predicted_edge_avg,
+                    realized_edge_avg,
+                    edge_error,
                 ),
             )
             con.commit()

@@ -30,6 +30,13 @@ def _safe_div(a: float, b: float) -> float:
     return a / b if b else 0.0
 
 
+def _to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _load_cycle_rows(db_path: Path, since_iso: str) -> list[sqlite3.Row]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -57,6 +64,10 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
     order_error_count = 0
     planned_total = 0
     placed_total = 0
+    predicted_edge_sum = 0.0
+    predicted_edge_count = 0
+    realized_edge_sum = 0.0
+    realized_edge_count = 0
 
     for row in rows:
         strategy = str(row["strategy"] or "unknown")
@@ -83,6 +94,26 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
         placed_total += len(placed)
         order_error_count += len(errs)
 
+        for p in planned:
+            if not isinstance(p, dict):
+                continue
+            if "expected_edge" in p:
+                predicted_edge_sum += _to_float(p.get("expected_edge"), 0.0)
+                predicted_edge_count += 1
+        for p in placed:
+            if not isinstance(p, dict):
+                continue
+            limit_v = _to_float(p.get("limit_price"), 0.0)
+            fill_v = _to_float(p.get("filled_avg_price"), 0.0)
+            side = str(p.get("side", "")).lower()
+            if limit_v <= 0 or fill_v <= 0:
+                continue
+            if side == "sell":
+                realized_edge_sum += (fill_v - limit_v) / limit_v
+            else:
+                realized_edge_sum += (limit_v - fill_v) / limit_v
+            realized_edge_count += 1
+
     strategy_attr = []
     for k in sorted(strategy_counts.keys()):
         strategy_attr.append(
@@ -108,14 +139,165 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
         )
 
     placement_ratio = _safe_div(placed_total, planned_total)
+    predicted_edge_avg = _safe_div(predicted_edge_sum, predicted_edge_count)
+    realized_edge_avg = _safe_div(realized_edge_sum, realized_edge_count)
+    edge_error = realized_edge_avg - predicted_edge_avg
     return {
         "cycle_count": len(rows),
         "orders_planned_total": planned_total,
         "orders_placed_total": placed_total,
         "placement_ratio": placement_ratio,
         "order_error_count": order_error_count,
+        "predicted_edge_avg": predicted_edge_avg,
+        "realized_edge_avg": realized_edge_avg,
+        "edge_error": edge_error,
+        "predicted_edge_samples": predicted_edge_count,
+        "realized_edge_samples": realized_edge_count,
         "strategy_attribution": strategy_attr,
         "segment_attribution": segment_attr,
+    }
+
+
+def _run_replay_scenario(rows: list[sqlite3.Row], risk_policy: dict[str, Any], assumptions: dict[str, float]) -> dict[str, Any]:
+    by_segment: dict[str, dict[str, Any]] = {}
+    equity = assumptions["starting_equity"]
+    max_equity = equity
+    max_drawdown = 0.0
+    wins = 0
+    losses = 0
+    trades = 0
+    net_pnl = 0.0
+    notional_total = 0.0
+
+    for row in rows:
+        segment = str(row["segment"] or "unknown")
+        if segment not in by_segment:
+            by_segment[segment] = {"trades": 0, "net_pnl": 0.0, "notional": 0.0, "wins": 0}
+        try:
+            planned = json.loads(row["orders_planned_json"] or "[]")
+        except json.JSONDecodeError:
+            planned = []
+
+        spread_bps = float(((risk_policy.get("allowedSegments") or {}).get(segment, {}) or {}).get("maxSpreadBps", 40.0))
+        spread_cost = (spread_bps * assumptions["spread_haircut_share"]) / 10000.0
+        for p in planned:
+            if not isinstance(p, dict):
+                continue
+            alloc = _to_float(p.get("allocation"), 0.0)
+            if alloc <= 0:
+                continue
+            symbol = str(p.get("symbol", ""))
+            expected_edge = _to_float(p.get("expected_edge"), 0.0)
+            if "/" in symbol:
+                slip = (assumptions["entry_slippage_bps_crypto"] + assumptions["exit_slippage_bps_crypto"]) / 10000.0
+            else:
+                slip = (assumptions["entry_slippage_bps_stocks"] + assumptions["exit_slippage_bps_stocks"]) / 10000.0
+            fee = (2.0 * assumptions["fee_bps_per_side"]) / 10000.0
+            net_edge = expected_edge - spread_cost - slip - fee
+            net_edge = min(assumptions["edge_clip_max"], max(assumptions["edge_clip_min"], net_edge))
+            trade_pnl = alloc * net_edge
+
+            trades += 1
+            notional_total += alloc
+            net_pnl += trade_pnl
+            by_segment[segment]["trades"] += 1
+            by_segment[segment]["net_pnl"] += trade_pnl
+            by_segment[segment]["notional"] += alloc
+            if trade_pnl >= 0:
+                wins += 1
+                by_segment[segment]["wins"] += 1
+            else:
+                losses += 1
+
+            equity += trade_pnl
+            max_equity = max(max_equity, equity)
+            max_drawdown = max(max_drawdown, _safe_div(max_equity - equity, max_equity))
+
+    for segment, stats in by_segment.items():
+        s_trades = float(stats["trades"])
+        stats["win_rate"] = _safe_div(float(stats["wins"]), s_trades)
+        stats["avg_net_edge"] = _safe_div(float(stats["net_pnl"]), float(stats["notional"]))
+        stats["net_pnl"] = round(float(stats["net_pnl"]), 2)
+        stats["notional"] = round(float(stats["notional"]), 2)
+        stats.pop("wins", None)
+
+    return {
+        "summary": {
+            "trades_replayed": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": _safe_div(float(wins), float(trades)),
+            "starting_equity": assumptions["starting_equity"],
+            "ending_equity": equity,
+            "net_return_pct": _safe_div(equity - assumptions["starting_equity"], assumptions["starting_equity"]) * 100.0,
+            "net_pnl": net_pnl,
+            "total_notional": notional_total,
+            "max_drawdown_pct": max_drawdown * 100.0,
+        },
+        "by_segment": by_segment,
+    }
+
+
+def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any]) -> dict[str, Any]:
+    scenarios: dict[str, dict[str, float]] = {
+        "base": {
+            "starting_equity": 10000.0,
+            "fee_bps_per_side": 0.0,
+            "entry_slippage_bps_stocks": 6.0,
+            "exit_slippage_bps_stocks": 6.0,
+            "entry_slippage_bps_crypto": 10.0,
+            "exit_slippage_bps_crypto": 10.0,
+            "spread_haircut_share": 0.6,
+            "edge_clip_min": -0.2,
+            "edge_clip_max": 0.3,
+        },
+        "conservative": {
+            "starting_equity": 10000.0,
+            "fee_bps_per_side": 2.0,
+            "entry_slippage_bps_stocks": 10.0,
+            "exit_slippage_bps_stocks": 10.0,
+            "entry_slippage_bps_crypto": 15.0,
+            "exit_slippage_bps_crypto": 15.0,
+            "spread_haircut_share": 0.8,
+            "edge_clip_min": -0.2,
+            "edge_clip_max": 0.3,
+        },
+        "stress": {
+            "starting_equity": 10000.0,
+            "fee_bps_per_side": 4.0,
+            "entry_slippage_bps_stocks": 15.0,
+            "exit_slippage_bps_stocks": 15.0,
+            "entry_slippage_bps_crypto": 24.0,
+            "exit_slippage_bps_crypto": 24.0,
+            "spread_haircut_share": 1.0,
+            "edge_clip_min": -0.25,
+            "edge_clip_max": 0.25,
+        },
+    }
+    results: dict[str, Any] = {}
+    for name, assumptions in scenarios.items():
+        scenario_result = _run_replay_scenario(rows=rows, risk_policy=risk_policy, assumptions=assumptions)
+        results[name] = {
+            "assumptions": assumptions,
+            "summary": scenario_result["summary"],
+            "by_segment": scenario_result["by_segment"],
+        }
+
+    base_return = float(results["base"]["summary"]["net_return_pct"])
+    conservative_return = float(results["conservative"]["summary"]["net_return_pct"])
+    stress_return = float(results["stress"]["summary"]["net_return_pct"])
+    return_band_low = min(base_return, conservative_return, stress_return)
+    return_band_high = max(base_return, conservative_return, stress_return)
+
+    return {
+        "scenarios": results,
+        "band": {
+            "return_low_pct": return_band_low,
+            "return_high_pct": return_band_high,
+            "base_return_pct": base_return,
+            "conservative_return_pct": conservative_return,
+            "stress_return_pct": stress_return,
+        },
     }
 
 
@@ -226,6 +408,7 @@ def _bounded_tuning(policy: dict[str, Any], cycle_review: dict[str, Any], exec_r
 def _write_report(path: Path, payload: dict[str, Any]) -> None:
     cycle_review = payload["cycle_review"]
     exec_review = payload["execution_quality"]
+    replay = payload["replay_backtest"]
     tuning = payload["tuning"]
     lines: list[str] = []
     lines.append(f"# Weekly Review ({payload['window']['since']} to {payload['window']['until']})")
@@ -237,6 +420,10 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     lines.append(f"- Missed fill rate: {exec_review['missed_fill_rate']:.2%}")
     lines.append(f"- Avg buy slippage (favorable +): {exec_review['avg_buy_slippage_bps']} bps")
     lines.append(f"- Avg sell slippage (favorable +): {exec_review['avg_sell_slippage_bps']} bps")
+    lines.append(
+        f"- Predicted vs realized edge: {cycle_review['predicted_edge_avg']:.4f} vs {cycle_review['realized_edge_avg']:.4f} "
+        f"(error {cycle_review['edge_error']:+.4f})"
+    )
     lines.append("")
     lines.append("## Strategy Attribution")
     for row in cycle_review["strategy_attribution"]:
@@ -247,6 +434,58 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
         lines.append(
             f"- {row['segment']}: cycles={row['cycles']}, planned={row['orders_planned']}, placed={row['orders_placed']}, placement_ratio={row['placement_ratio']:.2%}"
         )
+    lines.append("")
+    lines.append("## Replay Backtest (Bounded Return Band)")
+    replay_band = replay["band"]
+    lines.append(
+        f"- Return band (stress -> base): {replay_band['return_low_pct']:.2f}% to {replay_band['return_high_pct']:.2f}%"
+    )
+    lines.append(
+        f"- Scenario returns: base={replay_band['base_return_pct']:.2f}%, "
+        f"conservative={replay_band['conservative_return_pct']:.2f}%, stress={replay_band['stress_return_pct']:.2f}%"
+    )
+    lines.append("")
+    lines.append("## Replay Scenario Detail")
+    for scenario_name in ["base", "conservative", "stress"]:
+        scenario = replay["scenarios"][scenario_name]
+        replay_summary = scenario["summary"]
+        lines.append(f"- [{scenario_name}] assumptions: {json.dumps(scenario['assumptions'], separators=(',', ':'))}")
+        lines.append(
+            f"  trades={replay_summary['trades_replayed']}, win_rate={replay_summary['win_rate']:.2%}, "
+            f"net_return={replay_summary['net_return_pct']:.2f}%, max_drawdown={replay_summary['max_drawdown_pct']:.2f}%"
+        )
+        lines.append(
+            f"  start/end=${replay_summary['starting_equity']:.2f}->${replay_summary['ending_equity']:.2f}, "
+            f"net_pnl=${replay_summary['net_pnl']:.2f}"
+        )
+    lines.append("")
+    lines.append("## Replay Segment Breakdown (Base)")
+    replay_summary = replay["scenarios"]["base"]["summary"]
+    lines.append(
+        f"- Trades replayed: {replay_summary['trades_replayed']}, win_rate={replay_summary['win_rate']:.2%}, "
+        f"net_return={replay_summary['net_return_pct']:.2f}%, max_drawdown={replay_summary['max_drawdown_pct']:.2f}%"
+    )
+    lines.append(
+        f"- Start/End equity: ${replay_summary['starting_equity']:.2f} -> ${replay_summary['ending_equity']:.2f}; "
+        f"net_pnl=${replay_summary['net_pnl']:.2f}"
+    )
+    for segment, stats in replay["scenarios"]["base"]["by_segment"].items():
+        lines.append(
+            f"- {segment}: trades={stats['trades']}, win_rate={stats['win_rate']:.2%}, "
+            f"net_pnl=${stats['net_pnl']:.2f}, avg_net_edge={stats['avg_net_edge']:.4f}"
+        )
+    lines.append("")
+    lines.append("## Edge Calibration")
+    if cycle_review["predicted_edge_samples"] == 0:
+        lines.append("- No expected-edge samples were recorded in this window.")
+    elif cycle_review["realized_edge_samples"] == 0:
+        lines.append("- Expected-edge samples exist, but no realized fill-edge samples were available yet.")
+    elif cycle_review["edge_error"] < -0.01:
+        lines.append("- Model/rules are likely overestimating edge. Consider raising minExpectedEdge and reducing maxSignals.")
+    elif cycle_review["edge_error"] > 0.01:
+        lines.append("- Realized edge is beating predictions. You may be able to carefully loosen confidence/edge gates.")
+    else:
+        lines.append("- Predicted and realized edges are fairly aligned.")
     lines.append("")
     lines.append("## Bounded Tuning Suggestions")
     if tuning["suggested_changes"]:
@@ -273,12 +512,14 @@ def main() -> int:
     cycle_rows = _load_cycle_rows(journal.db_path, since_iso)
     cycle_review = _review_cycles(cycle_rows)
     execution_quality = _review_execution_quality(client, since_iso)
+    replay_backtest = _replay_backtest(cycle_rows, policy)
     tuned_policy, suggested_changes = _bounded_tuning(policy, cycle_review, execution_quality)
 
     payload = {
         "window": {"since": since.isoformat(), "until": now.isoformat(), "days": args.days},
         "cycle_review": cycle_review,
         "execution_quality": execution_quality,
+        "replay_backtest": replay_backtest,
         "tuning": {
             "suggested_changes": suggested_changes,
             "applied": False,

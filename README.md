@@ -38,6 +38,8 @@ This repository starts with operational checklists and safety-first defaults so 
 13. Run weekly performance review + bounded tuning suggestions:
    - `python scripts/weekly_review.py --days 7`
    - optional apply: `python scripts/weekly_review.py --days 7 --apply`
+14. Run log-replay backtest with slippage assumptions:
+   - `python scripts/replay_backtest.py --days 30 --starting-equity 10000`
 
 ## Repository Layout
 

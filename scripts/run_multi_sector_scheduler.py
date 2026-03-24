@@ -95,7 +95,12 @@ def main() -> int:
                     budget=budget,
                     execute=args.execute,
                 )
-                if not result.get("ai_allowed", False) and bool(ai_cfg.get("fallbackToRuleEngine", True)):
+                # Only fallback when AI actually ran and vetoed/failed.
+                if (
+                    bool(result.get("ai_used", False))
+                    and not result.get("ai_allowed", False)
+                    and bool(ai_cfg.get("fallbackToRuleEngine", True))
+                ):
                     fallback = run_once(
                         client=client,
                         risk_policy=policy,

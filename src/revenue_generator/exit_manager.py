@@ -111,8 +111,10 @@ class ExitManager:
         pdt_guard_enabled = bool(pdt_cfg.get("enabled", True))
         pdt_threshold = int(pdt_cfg.get("thresholdDayTrades", 3))
         pdt_allow_only_hard_stop = bool(pdt_cfg.get("allowOnlyHardStopAtThreshold", True))
+        pdt_near_limit_buffer = int(pdt_cfg.get("nearLimitBuffer", 1))
         account = self.client.get_account() if pdt_guard_enabled else {}
         daytrade_count = int(float(account.get("daytrade_count", 0) or 0)) if pdt_guard_enabled else 0
+        pdt_near_limit = daytrade_count >= max(0, pdt_threshold - max(0, pdt_near_limit_buffer))
         bought_today_equities: set[str] = set()
         if pdt_guard_enabled:
             try:
@@ -185,11 +187,11 @@ class ExitManager:
             if not trigger or sell_qty <= 0:
                 continue
 
-            # At PDT threshold, avoid same-day equity profit-taking exits.
+            # Near PDT limit, avoid same-day non-hard-stop exits for equities bought today.
             if (
                 pdt_guard_enabled
                 and pdt_allow_only_hard_stop
-                and daytrade_count >= pdt_threshold
+                and pdt_near_limit
                 and not _is_crypto_symbol(symbol)
                 and symbol in bought_today_equities
                 and trigger != "hard_stop_loss"
@@ -256,6 +258,8 @@ class ExitManager:
             "tracked_prices": len(prices),
             "actions": actions,
             "pdt_daytrade_count": daytrade_count,
+            "pdt_threshold": pdt_threshold,
+            "pdt_near_limit": pdt_near_limit,
             "pdt_blocked_exits": pdt_blocked_exits,
             "execute": execute,
             "exit_config": self.cfg.__dict__,

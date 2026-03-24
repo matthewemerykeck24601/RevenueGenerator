@@ -142,7 +142,13 @@ def run_once(
     external_cfg = risk_policy.get("externalResearch", {})
     if external_cfg.get("enabled", True):
         top_n = int(external_cfg.get("topCandidatesPerSegment", 12))
-        universe = select_external_candidates(segment=segment, symbols=list(universe), top_n=top_n)
+        regime_vix_ceiling = float(external_cfg.get("riskOffVixCeiling", 25.0))
+        universe = select_external_candidates(
+            segment=segment,
+            symbols=list(universe),
+            top_n=top_n,
+            regime_vix_ceiling=regime_vix_ceiling,
+        )
     max_spread_bps = float(segment_cfg.get("maxSpreadBps", 40))
     min_confidence = float(risk_policy.get("minSignalConfidence", 0.5))
     min_expected_edge = float(risk_policy.get("minExpectedEdge", 0.0))

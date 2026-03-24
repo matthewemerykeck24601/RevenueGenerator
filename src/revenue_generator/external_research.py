@@ -53,14 +53,33 @@ def _rank_symbol(symbol: str, yahoo_symbol: str, *, period: str, interval: str) 
     return symbol, score
 
 
+def _current_vix() -> float | None:
+    if yf is None:
+        return None
+    ticker = yf.Ticker("^VIX")
+    hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+    if hist is None or len(hist) < 1:
+        return None
+    closes = hist["Close"].dropna()
+    if len(closes) < 1:
+        return None
+    return _to_float(closes.iloc[-1], 0.0)
+
+
 def select_external_candidates(
     *,
     segment: str,
     symbols: list[str],
     top_n: int,
+    regime_vix_ceiling: float = 25.0,
 ) -> list[str]:
     if not symbols:
         return []
+    if segment == "pennyStocks":
+        vix = _current_vix()
+        if vix is not None and vix > regime_vix_ceiling:
+            # Risk-off regime: skip penny candidates until volatility cools.
+            return []
     scored: list[tuple[str, float]] = []
     if segment == "crypto":
         for sym in symbols:

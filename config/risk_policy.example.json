@@ -9,7 +9,8 @@
   "minExpectedEdge": 0.05,
   "externalResearch": {
     "enabled": true,
-    "topCandidatesPerSegment": 10
+    "topCandidatesPerSegment": 10,
+    "riskOffVixCeiling": 25
   },
   "aiScheduler": {
     "enabled": true,
@@ -19,9 +20,12 @@
     ],
     "fallbackToRuleEngine": true,
     "openclawTimeoutSeconds": 35,
+    "prefilterScoreThreshold": 0.035,
     "minBudgetUsd": 25,
     "minConfidenceForBuy": 0.7,
     "minExpectedEdgeForBuy": 0.05,
+    "slippageBufferBpsStocks": 6,
+    "slippageBufferBpsCrypto": 12,
     "marketHoursOnly": true,
     "timezone": "America/New_York",
     "marketOpen": "09:30",
@@ -66,8 +70,8 @@
     },
     "pennyStocks": {
       "enabled": true,
-      "maxSpreadBps": 80,
-      "minDollarVolume": 1000000,
+      "maxSpreadBps": 60,
+      "minDollarVolume": 2000000,
       "symbolsAllowlist": [
         "SNDL",
         "MULN",
@@ -120,7 +124,8 @@
   "pdtGuard": {
     "enabled": true,
     "thresholdDayTrades": 3,
-    "allowOnlyHardStopAtThreshold": true
+    "allowOnlyHardStopAtThreshold": true,
+    "nearLimitBuffer": 1
   },
   "exitHooks": {
     "firstTargetPct": 2.5,

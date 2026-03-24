@@ -45,6 +45,17 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No valid JSON object found in model output.")
 
 
+def _best_rule_prefilter_score(candidates: list[dict[str, Any]]) -> float:
+    best = 0.0
+    for item in candidates:
+        conf = _to_float(item.get("confidence"))
+        edge = _to_float(item.get("expected_edge"))
+        score = max(0.0, conf) * max(0.0, edge)
+        if score > best:
+            best = score
+    return best
+
+
 def build_openclaw_prompt(
     *,
     segment: str,
@@ -221,8 +232,8 @@ def validate_and_plan_signal(
     ai_cfg = risk_policy.get("aiScheduler", {})
     min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
     min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
-    if confidence < min_conf or expected_edge <= min_edge:
-        return AiSignalDecision(False, "Signal does not pass confidence/edge thresholds.", normalized, None)
+    if confidence < min_conf:
+        return AiSignalDecision(False, "Signal does not pass confidence threshold.", normalized, None)
 
     max_open = int(risk_policy.get("maxOpenPositions", 3))
     if len(open_positions) >= max_open and decision == "BUY":
@@ -243,6 +254,33 @@ def validate_and_plan_signal(
     if latest_price is None or latest_price <= 0:
         return AiSignalDecision(False, f"Could not fetch latest price for {symbol}.", normalized, None)
 
+    entry = signal.get("entry", {}) or {}
+    order_type = str(entry.get("order_type", "limit")).lower()
+    if order_type not in {"limit", "market"}:
+        order_type = "limit"
+    tif = str(entry.get("time_in_force", "gtc" if "/" in symbol else "day")).lower()
+    limit_price = _to_float(entry.get("limit_price"), latest_price)
+    if order_type == "limit" and limit_price <= 0:
+        limit_price = latest_price
+
+    # Subtract estimated spread/slippage cost before approving edge.
+    max_spread_bps = float(segment_cfg.get("maxSpreadBps", 40.0))
+    quoted_spread_bps = (
+        abs(limit_price - latest_price) / latest_price * 10000.0 if latest_price > 0 else max_spread_bps
+    )
+    baseline_spread_bps = max_spread_bps * 0.35
+    effective_spread_bps = min(max_spread_bps, max(quoted_spread_bps, baseline_spread_bps))
+    slippage_buffer_bps = float(
+        ai_cfg.get("slippageBufferBpsCrypto", 12.0) if "/" in symbol else ai_cfg.get("slippageBufferBpsStocks", 6.0)
+    )
+    estimated_cost_pct = (effective_spread_bps + slippage_buffer_bps) / 10000.0
+    net_expected_edge = expected_edge - estimated_cost_pct
+    normalized["estimated_cost_pct"] = estimated_cost_pct
+    normalized["expected_edge_net"] = net_expected_edge
+
+    if decision == "BUY" and net_expected_edge <= min_edge:
+        return AiSignalDecision(False, "Signal does not pass net edge threshold after execution costs.", normalized, None)
+
     raw_qty = alloc / latest_price
     is_crypto = "/" in symbol
     qty: float | int
@@ -255,15 +293,6 @@ def validate_and_plan_signal(
         if qty < 1:
             return AiSignalDecision(False, "Calculated stock quantity is less than one share.", normalized, None)
 
-    entry = signal.get("entry", {}) or {}
-    order_type = str(entry.get("order_type", "limit")).lower()
-    if order_type not in {"limit", "market"}:
-        order_type = "limit"
-    tif = str(entry.get("time_in_force", "gtc" if is_crypto else "day")).lower()
-    limit_price = _to_float(entry.get("limit_price"), latest_price)
-    if order_type == "limit" and limit_price <= 0:
-        limit_price = latest_price
-
     planned = {
         "symbol": symbol,
         "side": "buy" if decision == "BUY" else "sell",
@@ -273,6 +302,9 @@ def validate_and_plan_signal(
         "limit_price": round(limit_price, 6),
         "latest_price": latest_price,
         "allocation": round(alloc, 2),
+        "expected_edge": expected_edge,
+        "expected_edge_net": round(net_expected_edge, 6),
+        "estimated_cost_pct": round(estimated_cost_pct, 6),
     }
     return AiSignalDecision(True, "Signal approved by risk gate.", normalized, planned)
 
@@ -336,6 +368,7 @@ def run_ai_cycle(
 
     rule_based_signals: list[dict[str, Any]] = []
     market_context = ""
+    preview: dict[str, Any] | None = None
     try:
         preview = run_once(
             client=client,
@@ -362,6 +395,27 @@ def run_ai_cycle(
     except Exception:
         rule_based_signals = []
         market_context = ""
+
+    prefilter_threshold = float(ai_cfg.get("prefilterScoreThreshold", 0.035))
+    best_prefilter_score = _best_rule_prefilter_score(rule_based_signals)
+    if best_prefilter_score < prefilter_threshold:
+        if preview is None:
+            preview = {
+                "strategy": "rule_engine",
+                "segment": segment,
+                "budget": budget,
+                "execute": execute,
+                "orders_planned": [],
+                "orders_placed": [],
+                "order_errors": [],
+            }
+        preview = dict(preview)
+        preview["ai_used"] = False
+        preview["ai_prefilter_source"] = "rule_engine"
+        preview["ai_prefilter_threshold"] = prefilter_threshold
+        preview["ai_prefilter_best_score"] = round(best_prefilter_score, 6)
+        preview["ai_skipped_reason"] = "prefilter_below_threshold"
+        return preview
 
     signal = run_openclaw_analysis(
         segment=segment,
