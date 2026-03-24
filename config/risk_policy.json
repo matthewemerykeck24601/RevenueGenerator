@@ -12,8 +12,8 @@
   "cancelOpenOrdersBeforeRun": true,
   "cancelOpenOrdersAfterMinutes": 20,
   "equityBracketsEnabled": false,
-  "minSignalConfidence": 0.35,
-  "minExpectedEdge": -0.08,
+  "minSignalConfidence": 0.65,
+  "minExpectedEdge": 0.05,
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 20
@@ -26,7 +26,20 @@
     ],
     "fallbackToRuleEngine": true,
     "openclawTimeoutSeconds": 35,
-    "minBudgetUsd": 25
+    "minBudgetUsd": 25,
+    "minConfidenceForBuy": 0.7,
+    "minExpectedEdgeForBuy": 0.05,
+    "marketHoursOnly": true,
+    "timezone": "America/New_York",
+    "marketOpen": "09:30",
+    "marketClose": "16:00",
+    "activeWeekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
   "sectorCadence": {
     "pennyStocks": {

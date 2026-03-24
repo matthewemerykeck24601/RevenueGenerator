@@ -18,7 +18,7 @@ def pct_change(a: float, b: float) -> float:
     return (a - b) / b
 
 
-def compute_signal(symbol: str, bars: list[dict], max_spread_bps: float) -> Signal | None:
+def compute_signal(symbol: str, bars: list[dict], max_spread_bps: float, *, segment: str = "") -> Signal | None:
     if len(bars) < 2:
         return None
     closes = [float(b["c"]) for b in bars]
@@ -46,12 +46,20 @@ def compute_signal(symbol: str, bars: list[dict], max_spread_bps: float) -> Sign
     else:
         spread_bps = ((highs[-1] - lows[-1]) / p_now) * 10000 if p_now else 9999
     spread_penalty = min(spread_bps / max(max_spread_bps, 1.0), 0.9)
+    if segment == "pennyStocks":
+        # Penny names are much more vulnerable to hidden spread/slippage costs.
+        spread_penalty = min(spread_penalty * 1.75, 1.5)
 
     volume_boost = 0.0
     if len(vols) >= 2:
         avg_n = min(20, len(vols))
         avg_vol = max(sum(vols[-avg_n:]) / avg_n, 1.0)
         volume_boost = min((vols[-1] / avg_vol - 1.0) * 0.15, 0.2)
+    if segment == "pennyStocks" and len(vols) >= 5:
+        recent_avg = max(sum(vols[-5:]) / 5.0, 1.0)
+        recent_vol_surge = vols[-1] / recent_avg
+        if recent_vol_surge < 2.5:
+            volume_boost *= 0.5
 
     edge = (0.8 * momentum_score) + volume_boost - (0.25 * vol_penalty) - (0.2 * spread_penalty)
     confidence = max(min((edge + 1.0) / 2.0, 1.0), 0.0)
@@ -71,10 +79,12 @@ def select_top_signals(
     top_n: int = 3,
     min_confidence: float = 0.5,
     min_expected_edge: float = 0.0,
+    *,
+    segment: str = "",
 ) -> list[Signal]:
     signals: list[Signal] = []
     for symbol, bars in bars_by_symbol.items():
-        sig = compute_signal(symbol=symbol, bars=bars, max_spread_bps=max_spread_bps)
+        sig = compute_signal(symbol=symbol, bars=bars, max_spread_bps=max_spread_bps, segment=segment)
         if sig and sig.expected_edge >= min_expected_edge and sig.confidence >= min_confidence:
             signals.append(sig)
     signals.sort(key=lambda s: (s.expected_edge, s.confidence), reverse=True)

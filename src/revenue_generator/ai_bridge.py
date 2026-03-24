@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .alpaca_client import AlpacaClient
-from .bot import SEGMENT_UNIVERSE
+from .bot import SEGMENT_UNIVERSE, run_once
 
 
 @dataclass
@@ -45,37 +45,62 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No valid JSON object found in model output.")
 
 
-def build_openclaw_prompt(*, segment: str, budget: float, allowed_symbols: list[str], risk_policy: dict[str, Any]) -> str:
-    max_pos = float(risk_policy.get("maxPositionSizePct", 12.0))
-    max_open = int(risk_policy.get("maxOpenPositions", 3))
+def build_openclaw_prompt(
+    *,
+    segment: str,
+    budget: float,
+    allowed_symbols: list[str],
+    risk_policy: dict[str, Any],
+    rule_based_signals: list[dict[str, Any]] | None = None,
+    market_context: str = "",
+) -> str:
+    max_pos = float(risk_policy.get("maxPositionSizePct", 8.0))
+    max_open = int(risk_policy.get("maxOpenPositions", 15))
     stop_loss = float(risk_policy.get("stopLossPct", 2.2))
     tp1 = float((risk_policy.get("exitHooks") or {}).get("firstTargetPct", 3.0))
     tp2 = float((risk_policy.get("exitHooks") or {}).get("secondTargetPct", 6.0))
+    ai_cfg = risk_policy.get("aiScheduler", {})
+    min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
+    min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+
+    rule_context = ""
+    if rule_based_signals:
+        rule_context = (
+            "\nRule-based preliminary signals (use as strong prior, but override if you see better edge):\n"
+            + json.dumps(rule_based_signals, indent=2)
+        )
 
     return f"""
-You are generating one strict trading signal for an execution engine.
+You are a conservative, risk-aware trading signal generator for live execution on Alpaca.
 
-Constraints:
-- Segment: {segment}
-- Total budget USD: {budget:.2f}
-- Max position size pct of budget: {max_pos:.2f}
-- Max open positions: {max_open}
-- Allowed symbols: {", ".join(allowed_symbols)}
-- Baseline stop loss pct: {stop_loss:.2f}
-- Target 1 pct: {tp1:.2f}
-- Target 2 pct: {tp2:.2f}
+Segment: {segment} (focus especially on penny stocks if applicable — they are volatile, illiquid, prone to pumps/dumps and manipulation).
 
-Rules:
-- If confidence < 0.62 or expected_edge <= 0.03, return HOLD.
-- Never output symbols outside allowlist.
+Current budget: ${budget:.2f}
+Max position size % of budget: {max_pos:.2f}%
+Max open positions: {max_open}
+Allowed symbols: {", ".join(allowed_symbols)}
+Baseline hard stop-loss: -{stop_loss:.2f}%
+First target: +{tp1:.2f}% -> scale out 40%
+Second target: +{tp2:.2f}% -> scale out another 30%
+Trailing stop: 1.8%
+
+{rule_context}
+
+{market_context}
+
+Strict rules for LIVE trading:
+- Only BUY if you see a clear, realistic positive edge AFTER accounting for spreads/slippage (pennies often have 5-20% effective spreads).
+- Confidence must be >= {min_conf:.2f} and expected_edge >= {min_edge:.2f} for any BUY.
+- If edge is marginal or market looks choppy/manipulated, return HOLD.
+- Never exceed position limits or use symbols outside allowlist.
+- For penny stocks, be extra skeptical of volume spikes without fundamental/news catalyst.
 - For HOLD, set "symbol" to null and position_size_pct_of_budget to 0.
 - Use exact symbol formatting from allowlist (for example BTC/USD, not BTCUSDT).
-- Never exceed max position size pct.
-- Output JSON only, no markdown.
+- Output ONLY valid JSON, no extra text.
 
-Schema:
+Schema (exact):
 {{
-  "decision": "BUY|SELL|HOLD",
+  "decision": "BUY|HOLD",
   "symbol": "SYMBOL_OR_NULL",
   "segment": "{segment}",
   "confidence": 0.0,
@@ -86,7 +111,7 @@ Schema:
     "limit_price": 0.0,
     "time_in_force": "gtc|day"
   }},
-  "reasoning": ["short reason 1", "short reason 2"]
+  "reasoning": ["bullet 1", "bullet 2", "bullet 3"]
 }}
 """.strip()
 
@@ -98,12 +123,16 @@ def run_openclaw_analysis(
     allowed_symbols: list[str],
     risk_policy: dict[str, Any],
     timeout_seconds: int = 35,
+    rule_based_signals: list[dict[str, Any]] | None = None,
+    market_context: str = "",
 ) -> dict[str, Any]:
     prompt = build_openclaw_prompt(
         segment=segment,
         budget=budget,
         allowed_symbols=allowed_symbols,
         risk_policy=risk_policy,
+        rule_based_signals=rule_based_signals,
+        market_context=market_context,
     )
     openclaw_bin = shutil.which("openclaw")
     if not openclaw_bin:
@@ -189,7 +218,10 @@ def validate_and_plan_signal(
     if symbol not in allowed_symbols:
         return AiSignalDecision(False, f"Symbol '{symbol}' not allowed for segment '{segment}'.", normalized, None)
 
-    if confidence < 0.62 or expected_edge <= 0.03:
+    ai_cfg = risk_policy.get("aiScheduler", {})
+    min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
+    min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+    if confidence < min_conf or expected_edge <= min_edge:
         return AiSignalDecision(False, "Signal does not pass confidence/edge thresholds.", normalized, None)
 
     max_open = int(risk_policy.get("maxOpenPositions", 3))
@@ -302,12 +334,43 @@ def run_ai_cycle(
         except Exception:
             pass
 
+    rule_based_signals: list[dict[str, Any]] = []
+    market_context = ""
+    try:
+        preview = run_once(
+            client=client,
+            risk_policy=risk_policy,
+            segment=segment,
+            budget=budget,
+            execute=False,
+        )
+        for item in (preview.get("orders_planned") or [])[:5]:
+            rule_based_signals.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "confidence": _to_float(item.get("confidence")),
+                    "expected_edge": _to_float(item.get("expected_edge")),
+                    "limit_price": _to_float(item.get("limit_price")),
+                    "allocation": _to_float(item.get("allocation")),
+                }
+            )
+        market_context = (
+            f"Rule engine context: universe_size={preview.get('universe_size', 0)}, "
+            f"symbols_with_data={preview.get('symbols_with_data', 0)}, "
+            f"signals_considered={preview.get('signals_considered', 0)}."
+        )
+    except Exception:
+        rule_based_signals = []
+        market_context = ""
+
     signal = run_openclaw_analysis(
         segment=segment,
         budget=budget,
         allowed_symbols=allowed_symbols,
         risk_policy=risk_policy,
         timeout_seconds=timeout_seconds,
+        rule_based_signals=rule_based_signals,
+        market_context=market_context,
     )
     account = client.get_account()
     positions = client.get_open_positions()
@@ -338,6 +401,7 @@ def run_ai_cycle(
             place_error = str(err)
 
     return {
+        "strategy": "ai_direct",
         "account_status": account.get("status"),
         "segment": segment,
         "budget": budget,

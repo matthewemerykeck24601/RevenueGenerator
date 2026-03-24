@@ -48,15 +48,31 @@ class AlpacaClient:
     def get_open_positions(self) -> list[dict[str, Any]]:
         return self._get(self._trading_url("/positions"))
 
-    def get_orders(self, status: str = "all", limit: int = 100, direction: str = "desc") -> list[dict[str, Any]]:
+    def get_orders(
+        self,
+        status: str = "all",
+        limit: int = 100,
+        direction: str = "desc",
+        *,
+        after: str | None = None,
+        until: str | None = None,
+        symbols: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "status": status,
+            "limit": limit,
+            "direction": direction,
+            "nested": "false",
+        }
+        if after:
+            params["after"] = after
+        if until:
+            params["until"] = until
+        if symbols:
+            params["symbols"] = ",".join(symbols)
         return self._get(
             self._trading_url("/orders"),
-            params={
-                "status": status,
-                "limit": limit,
-                "direction": direction,
-                "nested": "false",
-            },
+            params=params,
         )
 
     def get_portfolio_history(

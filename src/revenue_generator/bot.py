@@ -236,6 +236,7 @@ def run_once(
         top_n=max_signals,
         min_confidence=min_confidence,
         min_expected_edge=min_expected_edge,
+        segment=segment,
     )
     orders = build_orders(
         signals=signals,
@@ -274,6 +275,7 @@ def run_once(
                 order_errors.append({"symbol": order.symbol, "error": str(err)})
 
     return {
+        "strategy": "rule_engine",
         "account_status": account.get("status"),
         "segment": segment,
         "budget": budget,

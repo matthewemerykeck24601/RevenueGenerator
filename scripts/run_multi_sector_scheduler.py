@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -35,6 +36,32 @@ def _default_profiles() -> dict:
     }
 
 
+def _parse_hhmm(value: str, default_hour: int, default_minute: int) -> tuple[int, int]:
+    try:
+        h, m = str(value).split(":", 1)
+        return int(h), int(m)
+    except Exception:
+        return default_hour, default_minute
+
+
+def _is_in_market_window(ai_cfg: dict) -> tuple[bool, str]:
+    if not bool(ai_cfg.get("marketHoursOnly", False)):
+        return True, "marketHoursOnly disabled"
+    tz_name = str(ai_cfg.get("timezone", "America/New_York"))
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+    weekdays = ai_cfg.get("activeWeekdays", [0, 1, 2, 3, 4])
+    if now_local.weekday() not in [int(x) for x in weekdays]:
+        return False, "outside active weekdays"
+    open_h, open_m = _parse_hhmm(str(ai_cfg.get("marketOpen", "09:30")), 9, 30)
+    close_h, close_m = _parse_hhmm(str(ai_cfg.get("marketClose", "16:00")), 16, 0)
+    current_mins = now_local.hour * 60 + now_local.minute
+    open_mins = open_h * 60 + open_m
+    close_mins = close_h * 60 + close_m
+    in_window = open_mins <= current_mins < close_mins
+    return in_window, f"{now_local.isoformat()} in {tz_name}"
+
+
 def main() -> int:
     args = parse_args()
     cfg = build_runtime_config()
@@ -57,7 +84,8 @@ def main() -> int:
         ai_cfg = policy.get("aiScheduler", {})
         ai_enabled = bool(ai_cfg.get("enabled", False))
         ai_segments = ai_cfg.get("segments", ["pennyStocks", "crypto", "indexFunds"])
-        use_ai = ai_enabled and segment in ai_segments
+        market_window_ok, market_window_note = _is_in_market_window(ai_cfg)
+        use_ai = ai_enabled and segment in ai_segments and market_window_ok
         try:
             if use_ai:
                 result = run_ai_cycle(
@@ -90,6 +118,9 @@ def main() -> int:
                     budget=budget,
                     execute=args.execute,
                 )
+                if ai_enabled and segment in ai_segments and not market_window_ok:
+                    result["ai_skipped_reason"] = "outside_market_hours_window"
+                    result["ai_skipped_detail"] = market_window_note
         except Exception as err:
             result = {
                 "segment": segment,

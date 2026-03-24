@@ -5,11 +5,34 @@
   "maxPositionSizePct": 10.0,
   "maxOpenPositions": 5,
   "buyCooldownMinutes": 180,
-  "minSignalConfidence": 0.5,
-  "minExpectedEdge": 0.0,
+  "minSignalConfidence": 0.65,
+  "minExpectedEdge": 0.05,
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 10
+  },
+  "aiScheduler": {
+    "enabled": true,
+    "segments": [
+      "pennyStocks",
+      "indexFunds"
+    ],
+    "fallbackToRuleEngine": true,
+    "openclawTimeoutSeconds": 35,
+    "minBudgetUsd": 25,
+    "minConfidenceForBuy": 0.7,
+    "minExpectedEdgeForBuy": 0.05,
+    "marketHoursOnly": true,
+    "timezone": "America/New_York",
+    "marketOpen": "09:30",
+    "marketClose": "16:00",
+    "activeWeekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
   "sectorCadence": {
     "pennyStocks": {

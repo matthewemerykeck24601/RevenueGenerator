@@ -69,7 +69,10 @@ class TradeJournal:
                     signals_considered INTEGER NOT NULL,
                     orders_planned_json TEXT NOT NULL,
                     orders_placed_json TEXT NOT NULL,
-                    notes TEXT
+                    notes TEXT,
+                    strategy TEXT,
+                    order_errors_json TEXT,
+                    raw_result_json TEXT
                 )
                 """
             )
@@ -88,9 +91,18 @@ class TradeJournal:
                 )
                 """
             )
+            self._ensure_column(con, "cycles", "strategy", "TEXT")
+            self._ensure_column(con, "cycles", "order_errors_json", "TEXT")
+            self._ensure_column(con, "cycles", "raw_result_json", "TEXT")
             con.commit()
         finally:
             con.close()
+
+    def _ensure_column(self, con: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        cols = {str(r[1]) for r in rows}
+        if column not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
     def log_cycle(self, result: dict[str, Any]) -> None:
         ts = datetime.now(timezone.utc).isoformat()
@@ -101,6 +113,15 @@ class TradeJournal:
         signals_considered = int(result.get("signals_considered", 0))
         planned = result.get("orders_planned", [])
         placed = result.get("orders_placed", [])
+        order_errors = result.get("order_errors", [])
+        strategy = str(
+            result.get("strategy")
+            or (
+                "ai_direct"
+                if bool(result.get("ai_used"))
+                else ("rule_fallback_from_ai" if bool(result.get("ai_fallback_used")) else "rule_engine")
+            )
+        )
         notes = str(result.get("reason", ""))
 
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
@@ -125,9 +146,9 @@ class TradeJournal:
                 """
                 INSERT INTO cycles (
                     ts, segment, budget, execute, account_status, signals_considered,
-                    orders_planned_json, orders_placed_json, notes
+                    orders_planned_json, orders_placed_json, notes, strategy, order_errors_json, raw_result_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ts,
@@ -139,6 +160,9 @@ class TradeJournal:
                     json.dumps(planned),
                     json.dumps(placed),
                     notes,
+                    strategy,
+                    json.dumps(order_errors),
+                    json.dumps(result),
                 ),
             )
             con.commit()
