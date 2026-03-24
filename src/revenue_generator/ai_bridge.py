@@ -50,7 +50,7 @@ def _best_rule_prefilter_score(candidates: list[dict[str, Any]]) -> float:
     for item in candidates:
         conf = _to_float(item.get("confidence"))
         edge = _to_float(item.get("expected_edge"))
-        score = max(0.0, conf) * max(0.0, edge)
+        score = max(0.0, conf) * max(0.02, edge)
         if score > best:
             best = score
     return best
@@ -74,6 +74,9 @@ def fetch_market_context(symbols: list[str], segment: str) -> str:
         "AVAX/USD": "AVAX-USD",
         "LTC/USD": "LTC-USD",
         "LINK/USD": "LINK-USD",
+        "BCH/USD": "BCH-USD",
+        "UNI/USD": "UNI-USD",
+        "AAVE/USD": "AAVE-USD",
     }
 
     summary_rows: list[str] = []

@@ -88,13 +88,28 @@ def main() -> int:
         use_ai = ai_enabled and segment in ai_segments and market_window_ok
         try:
             if use_ai:
-                result = run_ai_cycle(
-                    client=client,
-                    risk_policy=policy,
-                    segment=segment,
-                    budget=budget,
-                    execute=args.execute,
-                )
+                ai_error = None
+                try:
+                    result = run_ai_cycle(
+                        client=client,
+                        risk_policy=policy,
+                        segment=segment,
+                        budget=budget,
+                        execute=args.execute,
+                    )
+                except Exception as err:
+                    ai_error = str(err)
+                    result = {
+                        "segment": segment,
+                        "budget": budget,
+                        "execute": args.execute,
+                        "ai_used": True,
+                        "ai_allowed": False,
+                        "ai_reason": f"AI cycle failed: {ai_error}",
+                        "orders_planned": [],
+                        "orders_placed": [],
+                        "order_errors": [],
+                    }
                 # Only fallback when AI actually ran and vetoed/failed.
                 if (
                     bool(result.get("ai_used", False))
@@ -114,6 +129,8 @@ def main() -> int:
                         "ai_reason": result.get("ai_reason"),
                         "ai_signal": result.get("ai_signal"),
                     }
+                    if ai_error:
+                        fallback["ai_error"] = ai_error
                     result = fallback
             else:
                 result = run_once(

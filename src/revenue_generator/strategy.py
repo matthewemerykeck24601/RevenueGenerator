@@ -68,14 +68,19 @@ def compute_signal(symbol: str, bars: list[dict], max_spread_bps: float, *, segm
     window = min(20, len(closes))
     ranges = [(h - l) / c if c else 0.0 for h, l, c in zip(highs[-window:], lows[-window:], closes[-window:])]
     avg_range = sum(ranges) / len(ranges)
-    vol_penalty = min(avg_range * 2.5, 0.8)
+    vol_penalty = min(avg_range * 1.6, 0.7)
 
     # Spread estimate
+    # Daily bar range is not true spread; treat it as a loose liquidity proxy.
     if len(closes) <= 2:
         spread_bps = abs(pct_change(closes[-1], closes[0])) * 500
     else:
-        spread_bps = ((highs[-1] - lows[-1]) / p_now) * 10000 if p_now else 9999
-    spread_penalty = min(spread_bps / max(max_spread_bps, 1.0), 0.9)
+        range_bps = ((highs[-1] - lows[-1]) / p_now) * 10000 if p_now else 9999
+        if segment in {"indexFunds", "largeCapStocks"}:
+            spread_bps = min(range_bps * 0.12, max_spread_bps * 1.25)
+        else:
+            spread_bps = min(range_bps * 0.22, max_spread_bps * 1.6)
+    spread_penalty = min(spread_bps / max(max_spread_bps, 1.0), 0.75)
 
     # Volume confirmation
     volume_boost = 0.0
@@ -89,13 +94,26 @@ def compute_signal(symbol: str, bars: list[dict], max_spread_bps: float, *, segm
             volume_boost = -0.10  # low participation is a warning sign
 
     edge = (
-        (0.75 * momentum_score)
+        (0.95 * momentum_score)
         + rsi_boost
-        + volume_boost
-        - (0.20 * vol_penalty)
-        - (0.18 * spread_penalty)
+        + (1.15 * volume_boost)
+        - (0.12 * vol_penalty)
+        - (0.10 * spread_penalty)
     )
-    confidence = max(min((edge + 1.0) / 2.0, 1.0), 0.0)
+    if segment in {"indexFunds", "largeCapStocks"}:
+        edge += 0.30
+
+    # Decouple confidence from edge so quality setups can pass without requiring huge edge values.
+    confidence = (
+        0.48
+        + max(momentum_score, 0.0) * 0.34
+        + max(volume_boost, 0.0) * 0.45
+        + (0.05 if 40 <= rsi <= 65 else 0.0)
+        - (0.11 * vol_penalty)
+        - (0.08 * spread_penalty)
+    )
+    confidence += max(edge, 0.0) * 0.18
+    confidence = max(min(confidence, 1.0), 0.0)
 
     return Signal(
         symbol=symbol,

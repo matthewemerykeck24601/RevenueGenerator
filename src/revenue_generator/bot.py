@@ -63,6 +63,51 @@ def _bars_from_stock_snapshots(snapshots: dict[str, Any]) -> dict[str, list[dict
     return bars_by_symbol
 
 
+def _yahoo_symbol(symbol: str) -> str:
+    crypto_map = {
+        "BTC/USD": "BTC-USD",
+        "ETH/USD": "ETH-USD",
+        "SOL/USD": "SOL-USD",
+        "AVAX/USD": "AVAX-USD",
+        "LTC/USD": "LTC-USD",
+        "LINK/USD": "LINK-USD",
+        "BCH/USD": "BCH-USD",
+        "UNI/USD": "UNI-USD",
+        "AAVE/USD": "AAVE-USD",
+    }
+    return crypto_map.get(symbol, symbol)
+
+
+def _fetch_yfinance_daily_bars(symbols: list[str], limit: int = 40) -> dict[str, list[dict[str, float]]]:
+    try:
+        import yfinance as yf
+    except Exception:
+        return {}
+
+    out: dict[str, list[dict[str, float]]] = {}
+    for sym in symbols:
+        try:
+            ticker = yf.Ticker(_yahoo_symbol(sym))
+            hist = ticker.history(period="3mo", interval="1d", auto_adjust=False)
+            if hist is None or len(hist) < 2:
+                continue
+            rows = hist.tail(max(2, limit))
+            bars: list[dict[str, float]] = []
+            for _idx, row in rows.iterrows():
+                c = float(row.get("Close", 0.0) or 0.0)
+                h = float(row.get("High", 0.0) or 0.0)
+                l = float(row.get("Low", 0.0) or 0.0)
+                v = float(row.get("Volume", 0.0) or 0.0)
+                if c <= 0 or h <= 0 or l <= 0:
+                    continue
+                bars.append({"c": c, "h": h, "l": l, "v": v})
+            if len(bars) >= 2:
+                out[sym] = bars
+        except Exception:
+            continue
+    return out
+
+
 def build_orders(
     *,
     signals: list[Signal],
@@ -208,6 +253,14 @@ def run_once(
         bars = client.get_crypto_bars(universe, timeframe="1Hour", limit=80)
     elif segment in ("largeCapStocks", "indexFunds"):
         bars = client.get_stock_bars(universe, timeframe="1Day", limit=40)
+        # Alpaca can occasionally return only the latest bar for some symbols/feeds.
+        # Backfill from yfinance so signal quality doesn't collapse to zero.
+        shallow = [sym for sym in universe if len(bars.get(sym, [])) < 10]
+        if shallow:
+            yf_bars = _fetch_yfinance_daily_bars(shallow, limit=40)
+            for sym in shallow:
+                if len(bars.get(sym, [])) < 10 and len(yf_bars.get(sym, [])) >= 2:
+                    bars[sym] = yf_bars[sym]
     else:
         snapshots = client.get_stock_snapshots(universe)
         bars = _bars_from_stock_snapshots(snapshots)
