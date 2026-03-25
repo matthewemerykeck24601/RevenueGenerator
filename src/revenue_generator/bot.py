@@ -26,6 +26,8 @@ class PlannedOrder:
     limit_price: float
     confidence: float
     expected_edge: float
+    expected_edge_net: float
+    estimated_cost_pct: float
     allocation: float
 
 
@@ -122,10 +124,21 @@ def build_orders(
     max_daily_loss_pct = float(risk_policy.get("maxDailyLossPct", 2.0))
     max_position_size_pct = float(risk_policy.get("maxPositionSizePct", 10.0))
     allow_fractional_stocks = bool(risk_policy.get("allowFractionalStocks", True))
+    min_expected_edge_net = float(risk_policy.get("minExpectedEdgeNet", 0.0))
+    ai_cfg = risk_policy.get("aiScheduler", {})
+    stock_slippage_bps = float(ai_cfg.get("slippageBufferBpsStocks", 6.0))
+    crypto_slippage_bps = float(ai_cfg.get("slippageBufferBpsCrypto", 12.0))
 
     orders: list[PlannedOrder] = []
     remaining_budget = budget
     for sig in signals:
+        spread_cost_pct = max(sig.spread_bps, 0.0) / 10000.0
+        slippage_cost_pct = (crypto_slippage_bps if "/" in sig.symbol else stock_slippage_bps) / 10000.0
+        estimated_cost_pct = spread_cost_pct + slippage_cost_pct
+        expected_edge_net = sig.expected_edge - estimated_cost_pct
+        if expected_edge_net < min_expected_edge_net:
+            continue
+
         decision = evaluate_risk(
             start_equity=start_equity,
             current_equity=current_equity,
@@ -170,6 +183,8 @@ def build_orders(
                 limit_price=limit_price,
                 confidence=sig.confidence,
                 expected_edge=sig.expected_edge,
+                expected_edge_net=expected_edge_net,
+                estimated_cost_pct=estimated_cost_pct,
                 allocation=used_alloc,
             )
         )

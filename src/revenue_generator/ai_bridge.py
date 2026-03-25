@@ -163,6 +163,7 @@ def build_ai_prompt(
     ai_cfg = risk_policy.get("aiScheduler", {})
     min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
     min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+    min_net_edge = float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
 
     rule_context = ""
     if rule_based_signals:
@@ -426,7 +427,9 @@ def validate_and_plan_signal(
     normalized["estimated_cost_pct"] = estimated_cost_pct
     normalized["expected_edge_net"] = net_expected_edge
 
-    if decision == "BUY" and net_expected_edge <= min_edge:
+    if decision == "BUY" and expected_edge < min_edge:
+        return AiSignalDecision(False, "Signal does not pass gross edge threshold.", normalized, None)
+    if decision == "BUY" and net_expected_edge < min_net_edge:
         return AiSignalDecision(False, "Signal does not pass net edge threshold after execution costs.", normalized, None)
 
     raw_qty = alloc / latest_price

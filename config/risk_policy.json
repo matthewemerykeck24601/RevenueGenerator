@@ -14,6 +14,8 @@
       "maxOpenPositions": 20,
       "aiMinConfidenceForBuy": 0.5,
       "aiMinExpectedEdgeForBuy": 0.0,
+      "aiMinExpectedEdgeNetForBuy": 0.003,
+      "minExpectedEdgeNet": 0.003,
       "allowAddOnBuys": true,
       "sectorBudgetPct": {
         "largeCapStocks": 45,
@@ -26,9 +28,18 @@
       "pdtGuardEnabled": false,
       "maxPositionSizePct": 16.0,
       "maxOpenPositions": 28,
-      "aiMinConfidenceForBuy": 0.42,
+      "aiMinConfidenceForBuy": 0.5,
       "aiMinExpectedEdgeForBuy": 0.0,
+      "aiMinExpectedEdgeNetForBuy": 0.003,
+      "minExpectedEdgeNet": 0.003,
       "allowAddOnBuys": true,
+      "exitHooks": {
+        "firstTargetPct": 2.2,
+        "firstTargetSellPct": 55.0,
+        "secondTargetPct": 4.4,
+        "secondTargetSellPct": 30.0,
+        "trailingStopPct": 1.3
+      },
       "sectorBudgetPct": {
         "largeCapStocks": 50,
         "indexFunds": 30,
@@ -48,6 +59,7 @@
   "equityBracketsEnabled": false,
   "minSignalConfidence": 0.4,
   "minExpectedEdge": 0.0,
+  "minExpectedEdgeNet": 0.003,
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 20,
@@ -69,6 +81,7 @@
     "minBudgetUsd": 50,
     "minConfidenceForBuy": 0.5,
     "minExpectedEdgeForBuy": 0.0,
+    "minExpectedEdgeNetForBuy": 0.003,
     "slippageBufferBpsStocks": 5,
     "slippageBufferBpsCrypto": 10,
     "marketHoursOnly": true,

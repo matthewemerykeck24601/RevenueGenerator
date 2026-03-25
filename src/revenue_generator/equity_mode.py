@@ -48,12 +48,16 @@ def _apply_mode_overrides(risk_policy: dict[str, Any], mode_overrides: dict[str,
         risk_policy["maxOpenPositions"] = int(mode_overrides.get("maxOpenPositions"))
     if "allowAddOnBuys" in mode_overrides:
         risk_policy["allowAddOnBuys"] = bool(mode_overrides.get("allowAddOnBuys"))
+    if "minExpectedEdgeNet" in mode_overrides:
+        risk_policy["minExpectedEdgeNet"] = float(mode_overrides.get("minExpectedEdgeNet"))
 
     ai_cfg = risk_policy.setdefault("aiScheduler", {})
     if "aiMinConfidenceForBuy" in mode_overrides:
         ai_cfg["minConfidenceForBuy"] = float(mode_overrides.get("aiMinConfidenceForBuy"))
     if "aiMinExpectedEdgeForBuy" in mode_overrides:
         ai_cfg["minExpectedEdgeForBuy"] = float(mode_overrides.get("aiMinExpectedEdgeForBuy"))
+    if "aiMinExpectedEdgeNetForBuy" in mode_overrides:
+        ai_cfg["minExpectedEdgeNetForBuy"] = float(mode_overrides.get("aiMinExpectedEdgeNetForBuy"))
 
     cadence_overrides = mode_overrides.get("sectorBudgetPct")
     if isinstance(cadence_overrides, dict):
@@ -61,6 +65,13 @@ def _apply_mode_overrides(risk_policy: dict[str, Any], mode_overrides: dict[str,
         for segment, budget_pct in cadence_overrides.items():
             segment_cfg = sector_cadence.setdefault(str(segment), {})
             segment_cfg["budgetPct"] = float(budget_pct)
+
+    exit_overrides = mode_overrides.get("exitHooks")
+    if isinstance(exit_overrides, dict):
+        exit_hooks = risk_policy.setdefault("exitHooks", {})
+        for key, value in exit_overrides.items():
+            if key in {"firstTargetPct", "firstTargetSellPct", "secondTargetPct", "secondTargetSellPct", "trailingStopPct", "breakEvenBufferPct", "hardStopLossPct"}:
+                exit_hooks[key] = float(value)
 
 
 def apply_equity_mode_switch(

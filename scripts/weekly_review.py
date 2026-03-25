@@ -77,6 +77,124 @@ def _load_cycle_rows(db_path: Path, since_iso: str) -> list[sqlite3.Row]:
         con.close()
 
 
+def _review_trade_edge_efficiency(rows: list[sqlite3.Row], orders_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    gross_sum = 0.0
+    gross_n = 0
+    cost_sum = 0.0
+    cost_n = 0
+    net_sum = 0.0
+    net_n = 0
+    realized_sum = 0.0
+    realized_n = 0
+    capture_num = 0.0
+    capture_den = 0.0
+    by_segment: dict[str, dict[str, float]] = {}
+
+    for row in rows:
+        if not bool(row["execute"]):
+            continue
+        segment = str(row["segment"] or "unknown")
+        segment_stats = by_segment.setdefault(
+            segment,
+            {
+                "predicted_gross_sum": 0.0,
+                "predicted_gross_n": 0.0,
+                "estimated_cost_sum": 0.0,
+                "estimated_cost_n": 0.0,
+                "predicted_net_sum": 0.0,
+                "predicted_net_n": 0.0,
+                "realized_sum": 0.0,
+                "realized_n": 0.0,
+                "capture_num": 0.0,
+                "capture_den": 0.0,
+            },
+        )
+
+        try:
+            planned = json.loads(row["orders_planned_json"] or "[]")
+        except json.JSONDecodeError:
+            planned = []
+        try:
+            placed = json.loads(row["orders_placed_json"] or "[]")
+        except json.JSONDecodeError:
+            placed = []
+
+        placed_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for p in placed:
+            if not isinstance(p, dict):
+                continue
+            sym = str(p.get("symbol") or "")
+            if not sym:
+                continue
+            placed_by_symbol.setdefault(sym, []).append(p)
+
+        for p in planned:
+            if not isinstance(p, dict):
+                continue
+            symbol = str(p.get("symbol") or "")
+            predicted_gross = _to_float(p.get("expected_edge"), default=0.0)
+            estimated_cost = _to_float(p.get("estimated_cost_pct"), default=0.0)
+            predicted_net = _to_float(p.get("expected_edge_net"), default=predicted_gross - estimated_cost)
+
+            gross_sum += predicted_gross
+            gross_n += 1
+            cost_sum += estimated_cost
+            cost_n += 1
+            net_sum += predicted_net
+            net_n += 1
+            segment_stats["predicted_gross_sum"] += predicted_gross
+            segment_stats["predicted_gross_n"] += 1
+            segment_stats["estimated_cost_sum"] += estimated_cost
+            segment_stats["estimated_cost_n"] += 1
+            segment_stats["predicted_net_sum"] += predicted_net
+            segment_stats["predicted_net_n"] += 1
+
+            placed_match = None
+            if symbol and symbol in placed_by_symbol and placed_by_symbol[symbol]:
+                placed_match = placed_by_symbol[symbol].pop(0)
+            if not isinstance(placed_match, dict):
+                continue
+
+            order_id = str(placed_match.get("id") or "")
+            enriched = orders_by_id.get(order_id, placed_match) if order_id else placed_match
+            realized_f = _realized_edge_from_order(enriched)
+            if realized_f is None:
+                continue
+            realized_sum += realized_f
+            realized_n += 1
+            segment_stats["realized_sum"] += realized_f
+            segment_stats["realized_n"] += 1
+            if predicted_net > 0:
+                capture_num += realized_f
+                capture_den += predicted_net
+                segment_stats["capture_num"] += realized_f
+                segment_stats["capture_den"] += predicted_net
+
+    by_segment_out: list[dict[str, Any]] = []
+    for segment, stats in sorted(by_segment.items()):
+        by_segment_out.append(
+            {
+                "segment": segment,
+                "predicted_gross_avg": _safe_div(stats["predicted_gross_sum"], stats["predicted_gross_n"]),
+                "estimated_cost_avg": _safe_div(stats["estimated_cost_sum"], stats["estimated_cost_n"]),
+                "predicted_net_avg": _safe_div(stats["predicted_net_sum"], stats["predicted_net_n"]),
+                "realized_avg": _safe_div(stats["realized_sum"], stats["realized_n"]),
+                "realized_samples": int(stats["realized_n"]),
+                "net_edge_capture_ratio": _safe_div(stats["capture_num"], stats["capture_den"]),
+            }
+        )
+
+    return {
+        "predicted_gross_avg": _safe_div(gross_sum, gross_n),
+        "estimated_cost_avg": _safe_div(cost_sum, cost_n),
+        "predicted_net_avg": _safe_div(net_sum, net_n),
+        "realized_avg": _safe_div(realized_sum, realized_n),
+        "realized_samples": realized_n,
+        "net_edge_capture_ratio": _safe_div(capture_num, capture_den),
+        "by_segment": by_segment_out,
+    }
+
+
 def _review_cycles(rows: list[sqlite3.Row], orders_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
     strategy_counts: dict[str, int] = defaultdict(int)
     strategy_placed: dict[str, int] = defaultdict(int)
@@ -453,6 +571,7 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     exec_review = payload["execution_quality"]
     replay = payload["replay_backtest"]["executed_only"]
     replay_planned = payload["replay_backtest"]["planned_inclusive"]
+    edge_eff = payload["edge_efficiency"]
     tuning = payload["tuning"]
     lines: list[str] = []
     lines.append(f"# Weekly Review ({payload['window']['since']} to {payload['window']['until']})")
@@ -547,6 +666,22 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     else:
         lines.append("- Predicted and realized edges are fairly aligned.")
     lines.append("")
+    lines.append("## Net Edge Efficiency")
+    lines.append(
+        f"- Gross edge avg={edge_eff['predicted_gross_avg']:.4f}, est cost avg={edge_eff['estimated_cost_avg']:.4f}, "
+        f"predicted net avg={edge_eff['predicted_net_avg']:.4f}"
+    )
+    lines.append(
+        f"- Realized edge avg={edge_eff['realized_avg']:.4f} across {edge_eff['realized_samples']} samples; "
+        f"net-edge capture ratio={edge_eff['net_edge_capture_ratio']:.2f}x"
+    )
+    for row in edge_eff["by_segment"]:
+        lines.append(
+            f"- {row['segment']}: gross={row['predicted_gross_avg']:.4f}, cost={row['estimated_cost_avg']:.4f}, "
+            f"net={row['predicted_net_avg']:.4f}, realized={row['realized_avg']:.4f}, "
+            f"capture={row['net_edge_capture_ratio']:.2f}x, samples={row['realized_samples']}"
+        )
+    lines.append("")
     lines.append("## Bounded Tuning Suggestions")
     if tuning["suggested_changes"]:
         for c in tuning["suggested_changes"]:
@@ -573,6 +708,7 @@ def main() -> int:
     orders_by_id = _build_order_lookup(client, since_iso)
     cycle_review = _review_cycles(cycle_rows, orders_by_id)
     execution_quality = _review_execution_quality(client, since_iso)
+    edge_efficiency = _review_trade_edge_efficiency(cycle_rows, orders_by_id)
     replay_backtest = {
         "executed_only": _replay_backtest(cycle_rows, policy, include_dry_run=False),
         "planned_inclusive": _replay_backtest(cycle_rows, policy, include_dry_run=True),
@@ -583,6 +719,7 @@ def main() -> int:
         "window": {"since": since.isoformat(), "until": now.isoformat(), "days": args.days},
         "cycle_review": cycle_review,
         "execution_quality": execution_quality,
+        "edge_efficiency": edge_efficiency,
         "replay_backtest": replay_backtest,
         "tuning": {
             "suggested_changes": suggested_changes,
