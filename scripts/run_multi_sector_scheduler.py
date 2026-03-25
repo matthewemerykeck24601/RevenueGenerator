@@ -62,6 +62,34 @@ def _is_in_market_window(ai_cfg: dict) -> tuple[bool, str]:
     return in_window, f"{now_local.isoformat()} in {tz_name}"
 
 
+def _is_us_session_open(ai_cfg: dict) -> tuple[bool, str]:
+    tz_name = str(ai_cfg.get("timezone", "America/New_York"))
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+    weekdays = ai_cfg.get("activeWeekdays", [0, 1, 2, 3, 4])
+    if now_local.weekday() not in [int(x) for x in weekdays]:
+        return False, "outside active weekdays"
+    open_h, open_m = _parse_hhmm(str(ai_cfg.get("marketOpen", "09:30")), 9, 30)
+    close_h, close_m = _parse_hhmm(str(ai_cfg.get("marketClose", "16:00")), 16, 0)
+    current_mins = now_local.hour * 60 + now_local.minute
+    open_mins = open_h * 60 + open_m
+    close_mins = close_h * 60 + close_m
+    in_window = open_mins <= current_mins < close_mins
+    return in_window, f"{now_local.isoformat()} in {tz_name}"
+
+
+def _effective_profiles_for_clock(profiles: dict[str, dict], ai_cfg: dict) -> tuple[dict[str, dict], str]:
+    in_window, _note = _is_us_session_open(ai_cfg)
+    if in_window:
+        return profiles, "normal"
+
+    # Outside US market window: run crypto only and route full cycle budget there.
+    crypto_profile = dict(profiles.get("crypto", {"enabled": True, "intervalSeconds": 300, "budgetPct": 100}))
+    crypto_profile["enabled"] = True
+    crypto_profile["budgetPct"] = 100.0
+    return {"crypto": crypto_profile}, "crypto_only_after_hours"
+
+
 def main() -> int:
     args = parse_args()
     cfg = build_runtime_config()
@@ -72,6 +100,7 @@ def main() -> int:
     profiles = policy.get("sectorCadence") or _default_profiles()
     last_run: dict[str, datetime] = {}
     stop = {"flag": False}
+    last_schedule_mode: str | None = None
 
     def _stop_handler(_signum, _frame):
         stop["flag"] = True
@@ -84,8 +113,7 @@ def main() -> int:
         ai_cfg = policy.get("aiScheduler", {})
         ai_enabled = bool(ai_cfg.get("enabled", False))
         ai_segments = ai_cfg.get("segments", ["pennyStocks", "crypto", "indexFunds"])
-        market_window_ok, market_window_note = _is_in_market_window(ai_cfg)
-        use_ai = ai_enabled and segment in ai_segments and market_window_ok
+        use_ai = ai_enabled and segment in ai_segments
         try:
             if use_ai:
                 ai_error = None
@@ -140,9 +168,6 @@ def main() -> int:
                     budget=budget,
                     execute=args.execute,
                 )
-                if ai_enabled and segment in ai_segments and not market_window_ok:
-                    result["ai_skipped_reason"] = "outside_market_hours_window"
-                    result["ai_skipped_detail"] = market_window_note
         except Exception as err:
             result = {
                 "segment": segment,
@@ -155,7 +180,9 @@ def main() -> int:
         return result
 
     if args.once:
-        for segment, profile in profiles.items():
+        effective_profiles, schedule_mode = _effective_profiles_for_clock(profiles, policy.get("aiScheduler", {}))
+        print(f"Scheduler mode: {schedule_mode}")
+        for segment, profile in effective_profiles.items():
             if not profile.get("enabled", True):
                 continue
             _run_segment(segment, profile)
@@ -163,8 +190,12 @@ def main() -> int:
 
     print("Multi-sector scheduler started. Press Ctrl+C to stop.")
     while not stop["flag"]:
+        effective_profiles, schedule_mode = _effective_profiles_for_clock(profiles, policy.get("aiScheduler", {}))
+        if schedule_mode != last_schedule_mode:
+            print(f"Scheduler mode switched: {schedule_mode}")
+            last_schedule_mode = schedule_mode
         now = datetime.now(timezone.utc)
-        for segment, profile in profiles.items():
+        for segment, profile in effective_profiles.items():
             if not profile.get("enabled", True):
                 continue
             interval = int(profile.get("intervalSeconds", 300))

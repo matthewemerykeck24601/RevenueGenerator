@@ -383,6 +383,7 @@ def validate_and_plan_signal(
     ai_cfg = risk_policy.get("aiScheduler", {})
     min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
     min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+    min_net_edge = float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
     if confidence < min_conf:
         return AiSignalDecision(False, "Signal does not pass confidence threshold.", normalized, None)
 

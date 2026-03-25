@@ -100,7 +100,7 @@
     "minExpectedEdgeNetForBuy": 0.003,
     "slippageBufferBpsStocks": 5,
     "slippageBufferBpsCrypto": 10,
-    "marketHoursOnly": true,
+    "marketHoursOnly": false,
     "timezone": "America/New_York",
     "marketOpen": "09:30",
     "marketClose": "16:00",
