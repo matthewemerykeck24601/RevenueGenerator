@@ -12,6 +12,7 @@ import requests
 
 from .alpaca_client import AlpacaClient
 from .bot import SEGMENT_UNIVERSE, run_once
+from .external_research import discover_segment_candidates
 from .equity_mode import apply_equity_mode_switch
 
 
@@ -347,6 +348,7 @@ def validate_and_plan_signal(
     account: dict[str, Any],
     open_positions: list[dict[str, Any]],
     client: AlpacaClient,
+    allowed_symbols: list[str] | None = None,
 ) -> AiSignalDecision:
     decision = str(signal.get("decision", "HOLD")).upper()
     symbol = str(signal.get("symbol") or "")
@@ -374,8 +376,8 @@ def validate_and_plan_signal(
     if decision not in {"BUY", "SELL"}:
         return AiSignalDecision(False, "Invalid decision in signal.", normalized, None)
 
-    allowed_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
-    if symbol not in allowed_symbols:
+    allowed_symbols_effective = allowed_symbols or (segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, []))
+    if symbol not in allowed_symbols_effective:
         return AiSignalDecision(False, f"Symbol '{symbol}' not allowed for segment '{segment}'.", normalized, None)
 
     ai_cfg = risk_policy.get("aiScheduler", {})
@@ -478,7 +480,18 @@ def run_ai_cycle(
     ai_cfg = risk_policy.get("aiScheduler", {})
     timeout_seconds = int(ai_cfg.get("aiTimeoutSeconds", ai_cfg.get("openclawTimeoutSeconds", 35)))
     segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
-    allowed_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
+    base_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
+    discovery_cfg = risk_policy.get("marketDiscovery", {})
+    if bool(discovery_cfg.get("enabled", False)):
+        top_n = int(discovery_cfg.get("topCandidatesPerSegment", 20))
+        allowed_symbols = discover_segment_candidates(
+            segment=segment,
+            base_symbols=list(base_symbols),
+            top_n=top_n,
+            discovery_cfg=discovery_cfg,
+        )
+    else:
+        allowed_symbols = list(base_symbols)
     min_budget = float(ai_cfg.get("minBudgetUsd", 25.0))
     if budget < min_budget:
         return {
@@ -596,6 +609,7 @@ def run_ai_cycle(
         account=account,
         open_positions=positions,
         client=client,
+        allowed_symbols=allowed_symbols,
     )
 
     placed = None

@@ -68,6 +68,22 @@
       "pennyStocks"
     ]
   },
+  "marketDiscovery": {
+    "enabled": true,
+    "topCandidatesPerSegment": 24,
+    "maxSymbolsToScan": 160,
+    "cacheMinutes": 10,
+    "minPriceUsd": 10.0,
+    "minDollarVolumeUsd": 20000000.0,
+    "minPriceUsdBySegment": {
+      "pennyStocks": 1.0,
+      "crypto": 5.0
+    },
+    "minDollarVolumeUsdBySegment": {
+      "pennyStocks": 2000000.0,
+      "crypto": 5000000.0
+    }
+  },
   "aiScheduler": {
     "enabled": true,
     "segments": [

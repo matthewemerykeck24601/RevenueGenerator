@@ -6,7 +6,7 @@ from typing import Any
 
 from .alpaca_client import AlpacaClient
 from .equity_mode import apply_equity_mode_switch
-from .external_research import select_external_candidates, should_skip_cycle_for_vix
+from .external_research import discover_segment_candidates, select_external_candidates, should_skip_cycle_for_vix
 from .risk import evaluate_risk
 from .strategy import Signal, select_top_signals
 
@@ -238,7 +238,16 @@ def run_once(
                 "order_errors": [],
                 "equity_mode": equity_mode,
             }
-    if external_cfg.get("enabled", True):
+    discovery_cfg = risk_policy.get("marketDiscovery", {})
+    if bool(discovery_cfg.get("enabled", False)):
+        top_n = int(discovery_cfg.get("topCandidatesPerSegment", external_cfg.get("topCandidatesPerSegment", 20)))
+        universe = discover_segment_candidates(
+            segment=segment,
+            base_symbols=list(universe),
+            top_n=top_n,
+            discovery_cfg=discovery_cfg,
+        )
+    elif external_cfg.get("enabled", True):
         top_n = int(external_cfg.get("topCandidatesPerSegment", 12))
         regime_vix_ceiling = float(external_cfg.get("riskOffVixCeiling", 25.0))
         universe = select_external_candidates(
