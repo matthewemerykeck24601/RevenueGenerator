@@ -37,6 +37,28 @@ def _to_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _realized_edge_from_order(order: dict[str, Any]) -> float | None:
+    limit_v = _to_float(order.get("limit_price"), 0.0)
+    fill_v = _to_float(order.get("filled_avg_price"), 0.0)
+    side = str(order.get("side", "")).lower()
+    if limit_v <= 0 or fill_v <= 0:
+        return None
+    if side == "sell":
+        return (fill_v - limit_v) / limit_v
+    return (limit_v - fill_v) / limit_v
+
+
+def _build_order_lookup(client: AlpacaClient, since_iso: str) -> dict[str, dict[str, Any]]:
+    # Pull a larger window than default so edge calibration is less likely to truncate in active sessions.
+    orders = client.get_orders(status="all", limit=5000, direction="desc", after=since_iso)
+    out: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        order_id = str(order.get("id") or "")
+        if order_id:
+            out[order_id] = order
+    return out
+
+
 def _load_cycle_rows(db_path: Path, since_iso: str) -> list[sqlite3.Row]:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -55,12 +77,14 @@ def _load_cycle_rows(db_path: Path, since_iso: str) -> list[sqlite3.Row]:
         con.close()
 
 
-def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
+def _review_cycles(rows: list[sqlite3.Row], orders_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
     strategy_counts: dict[str, int] = defaultdict(int)
     strategy_placed: dict[str, int] = defaultdict(int)
     segment_counts: dict[str, int] = defaultdict(int)
     segment_planned: dict[str, int] = defaultdict(int)
     segment_placed: dict[str, int] = defaultdict(int)
+    cycle_count_all = len(rows)
+    cycle_count_execute = 0
     order_error_count = 0
     planned_total = 0
     placed_total = 0
@@ -70,6 +94,11 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
     realized_edge_count = 0
 
     for row in rows:
+        execute_flag = bool(row["execute"])
+        if not execute_flag:
+            continue
+
+        cycle_count_execute += 1
         strategy = str(row["strategy"] or "unknown")
         segment = str(row["segment"] or "unknown")
         try:
@@ -103,15 +132,14 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
         for p in placed:
             if not isinstance(p, dict):
                 continue
-            limit_v = _to_float(p.get("limit_price"), 0.0)
-            fill_v = _to_float(p.get("filled_avg_price"), 0.0)
-            side = str(p.get("side", "")).lower()
-            if limit_v <= 0 or fill_v <= 0:
+            enriched = p
+            order_id = str(p.get("id") or "")
+            if order_id and order_id in orders_by_id:
+                enriched = orders_by_id[order_id]
+            realized = _realized_edge_from_order(enriched)
+            if realized is None:
                 continue
-            if side == "sell":
-                realized_edge_sum += (fill_v - limit_v) / limit_v
-            else:
-                realized_edge_sum += (limit_v - fill_v) / limit_v
+            realized_edge_sum += realized
             realized_edge_count += 1
 
     strategy_attr = []
@@ -143,7 +171,8 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
     realized_edge_avg = _safe_div(realized_edge_sum, realized_edge_count)
     edge_error = realized_edge_avg - predicted_edge_avg
     return {
-        "cycle_count": len(rows),
+        "cycle_count": cycle_count_execute,
+        "cycle_count_all": cycle_count_all,
         "orders_planned_total": planned_total,
         "orders_placed_total": placed_total,
         "placement_ratio": placement_ratio,
@@ -158,7 +187,13 @@ def _review_cycles(rows: list[sqlite3.Row]) -> dict[str, Any]:
     }
 
 
-def _run_replay_scenario(rows: list[sqlite3.Row], risk_policy: dict[str, Any], assumptions: dict[str, float]) -> dict[str, Any]:
+def _run_replay_scenario(
+    rows: list[sqlite3.Row],
+    risk_policy: dict[str, Any],
+    assumptions: dict[str, float],
+    *,
+    include_dry_run: bool,
+) -> dict[str, Any]:
     by_segment: dict[str, dict[str, Any]] = {}
     equity = assumptions["starting_equity"]
     max_equity = equity
@@ -170,6 +205,8 @@ def _run_replay_scenario(rows: list[sqlite3.Row], risk_policy: dict[str, Any], a
     notional_total = 0.0
 
     for row in rows:
+        if not include_dry_run and not bool(row["execute"]):
+            continue
         segment = str(row["segment"] or "unknown")
         if segment not in by_segment:
             by_segment[segment] = {"trades": 0, "net_pnl": 0.0, "notional": 0.0, "wins": 0}
@@ -238,7 +275,7 @@ def _run_replay_scenario(rows: list[sqlite3.Row], risk_policy: dict[str, Any], a
     }
 
 
-def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any]) -> dict[str, Any]:
+def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any], *, include_dry_run: bool) -> dict[str, Any]:
     scenarios: dict[str, dict[str, float]] = {
         "base": {
             "starting_equity": 10000.0,
@@ -276,7 +313,12 @@ def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any]) -> di
     }
     results: dict[str, Any] = {}
     for name, assumptions in scenarios.items():
-        scenario_result = _run_replay_scenario(rows=rows, risk_policy=risk_policy, assumptions=assumptions)
+        scenario_result = _run_replay_scenario(
+            rows=rows,
+            risk_policy=risk_policy,
+            assumptions=assumptions,
+            include_dry_run=include_dry_run,
+        )
         results[name] = {
             "assumptions": assumptions,
             "summary": scenario_result["summary"],
@@ -290,6 +332,7 @@ def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any]) -> di
     return_band_high = max(base_return, conservative_return, stress_return)
 
     return {
+        "include_dry_run": include_dry_run,
         "scenarios": results,
         "band": {
             "return_low_pct": return_band_low,
@@ -302,7 +345,7 @@ def _replay_backtest(rows: list[sqlite3.Row], risk_policy: dict[str, Any]) -> di
 
 
 def _review_execution_quality(client: AlpacaClient, since_iso: str) -> dict[str, Any]:
-    orders = client.get_orders(status="all", limit=500, direction="desc", after=since_iso)
+    orders = client.get_orders(status="all", limit=5000, direction="desc", after=since_iso)
     submitted = len(orders)
     filled = 0
     rejected = 0
@@ -408,13 +451,14 @@ def _bounded_tuning(policy: dict[str, Any], cycle_review: dict[str, Any], exec_r
 def _write_report(path: Path, payload: dict[str, Any]) -> None:
     cycle_review = payload["cycle_review"]
     exec_review = payload["execution_quality"]
-    replay = payload["replay_backtest"]
+    replay = payload["replay_backtest"]["executed_only"]
+    replay_planned = payload["replay_backtest"]["planned_inclusive"]
     tuning = payload["tuning"]
     lines: list[str] = []
     lines.append(f"# Weekly Review ({payload['window']['since']} to {payload['window']['until']})")
     lines.append("")
     lines.append("## Topline")
-    lines.append(f"- Cycles reviewed: {cycle_review['cycle_count']}")
+    lines.append(f"- Cycles reviewed (executed / all): {cycle_review['cycle_count']} / {cycle_review['cycle_count_all']}")
     lines.append(f"- Orders planned/placed: {cycle_review['orders_planned_total']} / {cycle_review['orders_placed_total']} ({cycle_review['placement_ratio']:.2%})")
     lines.append(f"- Fill rate: {exec_review['fill_rate']:.2%}")
     lines.append(f"- Missed fill rate: {exec_review['missed_fill_rate']:.2%}")
@@ -426,10 +470,12 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     )
     lines.append("")
     lines.append("## Strategy Attribution")
+    lines.append("- Attribution below uses executed cycles only.")
     for row in cycle_review["strategy_attribution"]:
         lines.append(f"- {row['strategy']}: cycles={row['cycles']}, orders_placed={row['orders_placed']}, placed/cycle={row['placed_per_cycle']}")
     lines.append("")
     lines.append("## Segment Attribution")
+    lines.append("- Attribution below uses executed cycles only.")
     for row in cycle_review["segment_attribution"]:
         lines.append(
             f"- {row['segment']}: cycles={row['cycles']}, planned={row['orders_planned']}, placed={row['orders_placed']}, placement_ratio={row['placement_ratio']:.2%}"
@@ -443,6 +489,20 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     lines.append(
         f"- Scenario returns: base={replay_band['base_return_pct']:.2f}%, "
         f"conservative={replay_band['conservative_return_pct']:.2f}%, stress={replay_band['stress_return_pct']:.2f}%"
+    )
+    lines.append("")
+    lines.append("## Replay Mode Comparison")
+    lines.append(
+        f"- Executed-only base return: {replay['band']['base_return_pct']:.2f}% "
+        f"(band {replay['band']['return_low_pct']:.2f}% -> {replay['band']['return_high_pct']:.2f}%)"
+    )
+    lines.append(
+        f"- Planned-inclusive base return: {replay_planned['band']['base_return_pct']:.2f}% "
+        f"(band {replay_planned['band']['return_low_pct']:.2f}% -> {replay_planned['band']['return_high_pct']:.2f}%)"
+    )
+    lines.append(
+        f"- Base return drift (planned - executed): "
+        f"{(replay_planned['band']['base_return_pct'] - replay['band']['base_return_pct']):+.2f}%"
     )
     lines.append("")
     lines.append("## Replay Scenario Detail")
@@ -510,9 +570,13 @@ def main() -> int:
     client = AlpacaClient(cfg=cfg)
 
     cycle_rows = _load_cycle_rows(journal.db_path, since_iso)
-    cycle_review = _review_cycles(cycle_rows)
+    orders_by_id = _build_order_lookup(client, since_iso)
+    cycle_review = _review_cycles(cycle_rows, orders_by_id)
     execution_quality = _review_execution_quality(client, since_iso)
-    replay_backtest = _replay_backtest(cycle_rows, policy)
+    replay_backtest = {
+        "executed_only": _replay_backtest(cycle_rows, policy, include_dry_run=False),
+        "planned_inclusive": _replay_backtest(cycle_rows, policy, include_dry_run=True),
+    }
     tuned_policy, suggested_changes = _bounded_tuning(policy, cycle_review, execution_quality)
 
     payload = {

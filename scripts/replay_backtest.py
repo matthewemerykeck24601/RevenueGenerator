@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Maximum per-trade net edge (decimal) after costs.",
     )
+    p.add_argument(
+        "--include-dry-run",
+        action="store_true",
+        help="Include non-executed cycles in replay (default: executed cycles only).",
+    )
     return p.parse_args()
 
 
@@ -98,7 +103,13 @@ def _segment_spread_bps(policy: dict[str, Any], segment: str) -> float:
     return float(((policy.get("allowedSegments") or {}).get(segment, {}) or {}).get("maxSpreadBps", 40.0))
 
 
-def _run_replay(rows: list[sqlite3.Row], policy: dict[str, Any], assumptions: ReplayAssumptions) -> dict[str, Any]:
+def _run_replay(
+    rows: list[sqlite3.Row],
+    policy: dict[str, Any],
+    assumptions: ReplayAssumptions,
+    *,
+    include_dry_run: bool,
+) -> dict[str, Any]:
     equity = assumptions.starting_equity
     max_equity = equity
     max_drawdown = 0.0
@@ -111,8 +122,12 @@ def _run_replay(rows: list[sqlite3.Row], policy: dict[str, Any], assumptions: Re
 
     by_segment: dict[str, dict[str, Any]] = {}
     equity_curve: list[dict[str, Any]] = []
+    replayed_cycle_count = 0
 
     for row in rows:
+        if not include_dry_run and not bool(row["execute"]):
+            continue
+        replayed_cycle_count += 1
         segment = str(row["segment"] or "unknown")
         if segment not in by_segment:
             by_segment[segment] = {
@@ -187,7 +202,7 @@ def _run_replay(rows: list[sqlite3.Row], policy: dict[str, Any], assumptions: Re
 
     return {
         "summary": {
-            "cycles_replayed": len(rows),
+            "cycles_replayed": replayed_cycle_count,
             "trades_replayed": trade_count,
             "wins": wins,
             "losses": losses,
@@ -212,6 +227,9 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
     lines.append("# Replay Backtest Report")
     lines.append("")
     lines.append("## Summary")
+    lines.append(
+        f"- Input mode: {'executed + dry-run cycles' if payload.get('include_dry_run') else 'executed cycles only'}"
+    )
     lines.append(f"- Cycles replayed: {summary['cycles_replayed']}")
     lines.append(f"- Trades replayed: {summary['trades_replayed']}")
     lines.append(f"- Win rate: {summary['win_rate']:.2%}")
@@ -254,8 +272,9 @@ def main() -> int:
         edge_clip_min=args.edge_clip_min,
         edge_clip_max=args.edge_clip_max,
     )
-    payload = _run_replay(rows=rows, policy=policy, assumptions=assumptions)
+    payload = _run_replay(rows=rows, policy=policy, assumptions=assumptions, include_dry_run=args.include_dry_run)
     payload["window"] = {"since": since.isoformat(), "until": now.isoformat(), "days": args.days}
+    payload["include_dry_run"] = bool(args.include_dry_run)
 
     stamp = now.strftime("%Y%m%d-%H%M%S")
     out_dir = ROOT / "logs" / "reviews"
