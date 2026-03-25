@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from revenue_generator.alpaca_client import AlpacaClient
-from revenue_generator.config import build_runtime_config
+from revenue_generator.config import build_runtime_config, ensure_risk_policy
+from revenue_generator.equity_mode import apply_equity_mode_switch
 
 app = Flask(__name__)
 cfg = build_runtime_config()
 client = AlpacaClient(cfg=cfg)
+risk_policy = ensure_risk_policy()
 RESERVE_STATE_PATH = ROOT / "logs" / "reserve_state.json"
 
 
@@ -171,6 +174,10 @@ def _build_dashboard_payload() -> dict[str, Any]:
     # Deployable budget = current equity minus reserved cash.
     working_budget = max(equity - reserve_balance, 0.0)
     deployable_cash = max(cash - reserve_balance, 0.0)
+    # Apply equity mode overrides to derive the active max open positions cap.
+    policy_effective = deepcopy(risk_policy)
+    apply_equity_mode_switch(policy_effective, account=account)
+    max_open_positions = int(policy_effective.get("maxOpenPositions", 0))
 
     open_positions: list[dict[str, Any]] = []
     total_market_value = 0.0
@@ -217,6 +224,34 @@ def _build_dashboard_payload() -> dict[str, Any]:
     fifo_costs: dict[str, list[tuple[float, float]]] = {}
     sell_trades_evaluated = 0
     sell_wins = 0
+    ai_cfg = (policy_effective.get("aiScheduler") or {}) if "policy_effective" in locals() else {}
+    roundtrip_cost_pct_stocks = (_to_float(ai_cfg.get("slippageBufferBpsStocks"), 5.0) * 2.0) / 10000.0
+    roundtrip_cost_pct_crypto = (_to_float(ai_cfg.get("slippageBufferBpsCrypto"), 10.0) * 2.0) / 10000.0
+    net_sell_wins = 0
+    realized_win_pcts: list[float] = []
+    realized_loss_pcts: list[float] = []
+    gross_profit_usd = 0.0
+    gross_loss_usd = 0.0
+    segment_allow = (policy_effective.get("allowedSegments") or {}) if "policy_effective" in locals() else {}
+    index_symbols = set(segment_allow.get("indexFunds", {}).get("symbolsAllowlist", []))
+    large_cap_symbols = set(segment_allow.get("largeCapStocks", {}).get("symbolsAllowlist", []))
+    crypto_symbols = set(segment_allow.get("crypto", {}).get("symbolsAllowlist", []))
+    segment_stats: dict[str, dict[str, float]] = {
+        "indexFunds": {"evaluated": 0.0, "wins": 0.0},
+        "largeCapStocks": {"evaluated": 0.0, "wins": 0.0},
+        "crypto": {"evaluated": 0.0, "wins": 0.0},
+        "pennyStocks": {"evaluated": 0.0, "wins": 0.0},
+    }
+
+    def _segment_for_symbol(symbol: str) -> str:
+        if symbol in crypto_symbols or "/" in symbol:
+            return "crypto"
+        if symbol in index_symbols:
+            return "indexFunds"
+        if symbol in large_cap_symbols:
+            return "largeCapStocks"
+        return "pennyStocks"
+
     for fill in sorted(filled_orders, key=lambda r: r["filled_at"]):
         symbol = str(fill.get("symbol") or "")
         side = str(fill.get("side") or "").lower()
@@ -251,12 +286,47 @@ def _build_dashboard_payload() -> dict[str, Any]:
 
         avg_cost = consumed_cost / consumed_qty
         realized_pl_pct = ((price - avg_cost) / avg_cost * 100.0) if avg_cost > 0 else 0.0
+        realized_pl_usd = (price - avg_cost) * consumed_qty
         fill["realized_pl_pct"] = realized_pl_pct
         sell_trades_evaluated += 1
         if realized_pl_pct > 0:
             sell_wins += 1
+            realized_win_pcts.append(realized_pl_pct)
+        elif realized_pl_pct < 0:
+            realized_loss_pcts.append(abs(realized_pl_pct))
+
+        if realized_pl_usd > 0:
+            gross_profit_usd += realized_pl_usd
+        elif realized_pl_usd < 0:
+            gross_loss_usd += abs(realized_pl_usd)
+
+        seg = _segment_for_symbol(symbol)
+        seg_bucket = segment_stats.setdefault(seg, {"evaluated": 0.0, "wins": 0.0})
+        seg_bucket["evaluated"] += 1.0
+        if realized_pl_pct > 0:
+            seg_bucket["wins"] += 1.0
+
+        is_crypto = seg == "crypto"
+        net_realized_pl_pct = realized_pl_pct - ((roundtrip_cost_pct_crypto if is_crypto else roundtrip_cost_pct_stocks) * 100.0)
+        fill["net_realized_pl_pct"] = net_realized_pl_pct
+        if net_realized_pl_pct > 0:
+            net_sell_wins += 1
 
     sell_win_rate_pct = (sell_wins / sell_trades_evaluated * 100.0) if sell_trades_evaluated > 0 else 0.0
+    net_sell_win_rate_pct = (net_sell_wins / sell_trades_evaluated * 100.0) if sell_trades_evaluated > 0 else 0.0
+    avg_win_pct = (sum(realized_win_pcts) / len(realized_win_pcts)) if realized_win_pcts else 0.0
+    avg_loss_pct = (sum(realized_loss_pcts) / len(realized_loss_pcts)) if realized_loss_pcts else 0.0
+    payoff_ratio = (avg_win_pct / avg_loss_pct) if avg_loss_pct > 0 else 0.0
+    profit_factor = (gross_profit_usd / gross_loss_usd) if gross_loss_usd > 0 else 0.0
+    sell_win_rate_by_segment: dict[str, dict[str, float]] = {}
+    for seg_name, bucket in segment_stats.items():
+        evaluated = int(bucket.get("evaluated", 0))
+        wins = int(bucket.get("wins", 0))
+        sell_win_rate_by_segment[seg_name] = {
+            "evaluated": evaluated,
+            "wins": wins,
+            "win_rate_pct": (wins / evaluated * 100.0) if evaluated > 0 else 0.0,
+        }
 
     recent_fills = list(filled_orders)
     recent_fills.sort(key=lambda r: r["filled_at"], reverse=True)
@@ -295,11 +365,21 @@ def _build_dashboard_payload() -> dict[str, Any]:
             "day_pnl": day_pnl,
             "day_pnl_pct": day_pnl_pct,
             "open_positions_count": len(open_positions),
+            "max_open_positions": max_open_positions,
             "open_positions_market_value": total_market_value,
             "open_positions_unrealized_pl": total_unrealized_pl,
             "sell_trades_evaluated": sell_trades_evaluated,
             "sell_wins": sell_wins,
             "sell_win_rate_pct": sell_win_rate_pct,
+            "net_sell_wins": net_sell_wins,
+            "net_sell_win_rate_pct": net_sell_win_rate_pct,
+            "avg_win_pct": avg_win_pct,
+            "avg_loss_pct": avg_loss_pct,
+            "payoff_ratio": payoff_ratio,
+            "profit_factor": profit_factor,
+            "roundtrip_cost_bps_stocks": roundtrip_cost_pct_stocks * 10000.0,
+            "roundtrip_cost_bps_crypto": roundtrip_cost_pct_crypto * 10000.0,
+            "sell_win_rate_by_segment": sell_win_rate_by_segment,
             "reserve_balance": reserve_balance,
             "reserve_target_request": reserve_target_request,
             "deployable_cash": deployable_cash,
@@ -375,6 +455,9 @@ LIVE_HTML = """
       .panelBody { flex: 1; min-height: 0; }
       .scroll { height: 100%; overflow: auto; }
       #equityChart { width: 100% !important; height: 100% !important; }
+      .segTable { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 11px; }
+      .segTable th, .segTable td { border-bottom: 1px solid #223056; padding: 5px; text-align: right; }
+      .segTable th:first-child, .segTable td:first-child { text-align: left; }
       .metricGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
       .metricItem { background: #0f1830; border: 1px solid #2b3b67; border-radius: 8px; padding: 8px; }
       .metricItem .label { color: var(--muted); font-size: 11px; }
@@ -429,6 +512,9 @@ LIVE_HTML = """
       <div class="card"><div class="k">Balance (Equity)</div><div class="v" id="equity">$0</div></div>
       <div class="card"><div class="k">Open Positions</div><div class="v" id="openCountTop">0</div></div>
       <div class="card"><div class="k">Sell Win Rate</div><div class="v" id="sellWinRateTop">0.00%</div></div>
+      <div class="card"><div class="k">Net Sell Win Rate</div><div class="v" id="netSellWinRateTop">0.00%</div></div>
+      <div class="card"><div class="k">Payoff Ratio</div><div class="v" id="payoffRatioTop">0.00x</div></div>
+      <div class="card"><div class="k">Profit Factor</div><div class="v" id="profitFactorTop">0.00x</div></div>
       <div class="card"><div class="k">Reserve Pot</div><div class="v" id="reserveTop">$0</div></div>
       <div class="card"><div class="k">Cash</div><div class="v" id="cash">$0</div></div>
       <div class="card"><div class="k">Deployable Cash</div><div class="v" id="deployableCash">$0</div></div>
@@ -492,6 +578,15 @@ LIVE_HTML = """
               <div class="label">Cash Ratio (Cash / Equity)</div>
               <div class="value" id="mCashPct">0.00%</div>
               <div class="miniBar"><div id="mCashBar"></div></div>
+            </div>
+            <div class="metricItem" style="margin-top:8px;">
+              <div class="label">Sell Win Rate by Segment</div>
+              <table class="segTable" id="segmentWinTable">
+                <thead>
+                  <tr><th>Segment</th><th>Wins</th><th>Evaluated</th><th>Win %</th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -580,6 +675,16 @@ LIVE_HTML = """
         document.getElementById("mCashPct").textContent = fmtPct(cashPct);
         document.getElementById("mUtilBar").style.width = `${Math.max(0, Math.min(100, utilPct)).toFixed(2)}%`;
         document.getElementById("mCashBar").style.width = `${Math.max(0, Math.min(100, cashPct)).toFixed(2)}%`;
+
+        const segTableBody = document.querySelector("#segmentWinTable tbody");
+        segTableBody.innerHTML = "";
+        const segMap = s.sell_win_rate_by_segment || {};
+        for (const seg of ["largeCapStocks", "indexFunds", "crypto", "pennyStocks"]) {
+          const row = segMap[seg] || { wins: 0, evaluated: 0, win_rate_pct: 0 };
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${seg}</td><td>${row.wins || 0}</td><td>${row.evaluated || 0}</td><td>${fmtPct(row.win_rate_pct || 0)}</td>`;
+          segTableBody.appendChild(tr);
+        }
       }
 
       async function setReserveTarget() {
@@ -621,8 +726,13 @@ LIVE_HTML = """
 
         document.getElementById("budget").textContent = fmt(s.working_budget);
         document.getElementById("equity").textContent = fmt(s.equity);
-        document.getElementById("openCountTop").textContent = String(s.open_positions_count || 0);
+        const openCount = Number(s.open_positions_count || 0);
+        const maxOpen = Number(s.max_open_positions || 0);
+        document.getElementById("openCountTop").textContent = maxOpen > 0 ? `${openCount}/${maxOpen}` : String(openCount);
         document.getElementById("sellWinRateTop").textContent = fmtPct(s.sell_win_rate_pct);
+        document.getElementById("netSellWinRateTop").textContent = fmtPct(s.net_sell_win_rate_pct);
+        document.getElementById("payoffRatioTop").textContent = `${Number(s.payoff_ratio || 0).toFixed(2)}x`;
+        document.getElementById("profitFactorTop").textContent = `${Number(s.profit_factor || 0).toFixed(2)}x`;
         document.getElementById("reserveTop").textContent = fmt(s.reserve_balance);
         document.getElementById("cash").textContent = fmt(s.cash);
         document.getElementById("deployableCash").textContent = fmt(s.deployable_cash);
