@@ -19,6 +19,16 @@ CRYPTO_TO_YAHOO = {
     "BCH/USD": "BCH-USD",
     "UNI/USD": "UNI-USD",
     "AAVE/USD": "AAVE-USD",
+    "DOGE/USD": "DOGE-USD",
+    "DOT/USD": "DOT-USD",
+    "SHIB/USD": "SHIB-USD",
+    "XTZ/USD": "XTZ-USD",
+    "MKR/USD": "MKR-USD",
+    "GRT/USD": "GRT-USD",
+    "BAT/USD": "BAT-USD",
+    "CRV/USD": "CRV-USD",
+    "SUSHI/USD": "SUSHI-USD",
+    "ALGO/USD": "ALGO-USD",
 }
 
 # Broader discovery seed universe. This is intentionally larger than static allowlists
@@ -159,6 +169,16 @@ DISCOVERY_SEED_UNIVERSE: dict[str, list[str]] = {
         "BCH/USD",
         "UNI/USD",
         "AAVE/USD",
+        "DOGE/USD",
+        "DOT/USD",
+        "SHIB/USD",
+        "XTZ/USD",
+        "MKR/USD",
+        "GRT/USD",
+        "BAT/USD",
+        "CRV/USD",
+        "SUSHI/USD",
+        "ALGO/USD",
     ],
 }
 
@@ -316,6 +336,7 @@ def discover_segment_candidates(
     base_symbols: list[str],
     top_n: int,
     discovery_cfg: dict[str, Any] | None = None,
+    kraken_client: Any | None = None,
 ) -> list[str]:
     cfg = discovery_cfg or {}
     if not bool(cfg.get("enabled", False)):
@@ -328,8 +349,16 @@ def discover_segment_candidates(
     if cached and (now - cached[0]) <= timedelta(minutes=max(cache_minutes, 1)):
         return cached[1]
 
+    if segment == "crypto" and kraken_client is not None:
+        return _discover_crypto_via_kraken(
+            kraken_client=kraken_client,
+            base_symbols=base_symbols,
+            top_n=top_n,
+            cfg=cfg,
+            cache_key=cache_key,
+        )
+
     seed = DISCOVERY_SEED_UNIVERSE.get(segment, [])
-    # Keep deterministic order while merging.
     merged_symbols: list[str] = []
     seen: set[str] = set()
     for symbol in [*base_symbols, *seed]:
@@ -391,5 +420,44 @@ def discover_segment_candidates(
 
     scored.sort(key=lambda x: x[1], reverse=True)
     selected = [sym for sym, _score in scored[:top_n]]
+    _DISCOVERY_CACHE[cache_key] = (now, selected)
+    return selected
+
+
+def _discover_crypto_via_kraken(
+    *,
+    kraken_client: Any,
+    base_symbols: list[str],
+    top_n: int,
+    cfg: dict[str, Any],
+    cache_key: str,
+) -> list[str]:
+    """Scan all Kraken USD pairs, score by volume * range, return top candidates."""
+    now = datetime.now(timezone.utc)
+    min_vol_usd = float(cfg.get("minDollarVolumeUsdBySegment", {}).get("crypto", 50_000))
+    try:
+        candidates = kraken_client.discover_tradeable_pairs(
+            min_24h_volume_usd=min_vol_usd,
+            top_n=max(top_n * 3, 80),
+        )
+    except Exception:
+        fallback = base_symbols[:top_n]
+        _DISCOVERY_CACHE[cache_key] = (now, fallback)
+        return fallback
+
+    if not candidates:
+        fallback = base_symbols[:top_n]
+        _DISCOVERY_CACHE[cache_key] = (now, fallback)
+        return fallback
+
+    scored: list[tuple[str, float]] = []
+    for c in candidates:
+        vol = c.get("volume_usd_24h", 0)
+        range_pct = c.get("range_pct_24h", 0)
+        score = (vol / 1_000_000) * max(range_pct, 0.1)
+        scored.append((c["symbol"], score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    selected = [sym for sym, _ in scored[:top_n]]
     _DISCOVERY_CACHE[cache_key] = (now, selected)
     return selected

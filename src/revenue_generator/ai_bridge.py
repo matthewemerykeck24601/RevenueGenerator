@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from .alpaca_client import AlpacaClient
 from .bot import SEGMENT_UNIVERSE, run_once
 from .external_research import discover_segment_candidates
 from .equity_mode import apply_equity_mode_switch
+from .fear_climate import apply_fear_climate_overrides, load_fear_climate_state
 
 
 @dataclass
@@ -91,53 +93,75 @@ def _log_ai_call(
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def fetch_market_context(symbols: list[str], segment: str) -> str:
-    """Fetch recent price/volume context for AI prompt enrichment using yfinance."""
+def fetch_market_context(symbols: list[str], segment: str, client: Any = None, risk_policy: dict[str, Any] | None = None) -> str:
+    """Fetch recent price/volume context for AI prompt. Uses Kraken data for crypto if available."""
+    lines: list[str] = []
+    lines.append(f"Live market snapshot ({date.today().isoformat()}) for {segment}:")
+    summary_rows: list[str] = []
+    covered: set[str] = set()
+
+    from .kraken_client import KrakenClient as _KC
+    if segment == "crypto" and isinstance(client, _KC):
+        try:
+            ai_cfg = (risk_policy or {}).get("aiScheduler", {})
+            ctx_tf = str(ai_cfg.get("cryptoContextTimeframe", "15Min"))
+            ctx_limit = int(ai_cfg.get("cryptoContextBars", 16))
+            bars_map = client.get_crypto_bars(symbols[:12], timeframe=ctx_tf, limit=ctx_limit)
+            for sym in symbols[:12]:
+                bars = bars_map.get(sym, [])
+                if len(bars) < 2:
+                    continue
+                last = bars[-1]["c"]
+                prev = bars[-2]["c"]
+                first = bars[0]["c"]
+                ret_1d = ((last - prev) / prev * 100) if prev > 0 else 0
+                ret_5d = ((last - first) / first * 100) if first > 0 else 0
+                vols = [b["v"] for b in bars]
+                vol_avg = sum(vols) / len(vols) if vols else 1
+                vol_ratio = vols[-1] / max(vol_avg, 1) if vols else 0
+                summary_rows.append(
+                    f"  {sym}: price={last:.4f}, 1d={ret_1d:+.2f}%, 5d={ret_5d:+.2f}%, vol_ratio={vol_ratio:.2f}x"
+                )
+                covered.add(sym)
+        except Exception:
+            pass
+
     try:
         import yfinance as yf
     except ImportError:
-        return ""
+        yf = None
 
-    lines: list[str] = []
-    lines.append(f"Live market snapshot ({date.today().isoformat()}) for {segment}:")
-
-    # Map crypto to Yahoo format
-    yahoo_map = {
-        "BTC/USD": "BTC-USD",
-        "ETH/USD": "ETH-USD",
-        "SOL/USD": "SOL-USD",
-        "AVAX/USD": "AVAX-USD",
-        "LTC/USD": "LTC-USD",
-        "LINK/USD": "LINK-USD",
-        "BCH/USD": "BCH-USD",
-        "UNI/USD": "UNI-USD",
-        "AAVE/USD": "AAVE-USD",
-    }
-
-    summary_rows: list[str] = []
-    for sym in symbols[:8]:  # cap to avoid slow calls
-        yahoo_sym = yahoo_map.get(sym, sym)
-        try:
-            ticker = yf.Ticker(yahoo_sym)
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-            if hist is None or len(hist) < 2:
+    if yf:
+        from .external_research import CRYPTO_TO_YAHOO
+        yahoo_map = dict(CRYPTO_TO_YAHOO)
+        for sym in symbols[:12]:
+            if sym in covered:
                 continue
-            closes = hist["Close"].dropna().tolist()
-            vols = hist["Volume"].fillna(0).tolist()
-            if len(closes) < 2:
+            if "/" in sym and sym not in yahoo_map:
+                yahoo_sym = sym.replace("/", "-")
+            else:
+                yahoo_sym = yahoo_map.get(sym, sym)
+            try:
+                ticker = yf.Ticker(yahoo_sym)
+                hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+                if hist is None or len(hist) < 2:
+                    continue
+                closes = hist["Close"].dropna().tolist()
+                vols = hist["Volume"].fillna(0).tolist()
+                if len(closes) < 2:
+                    continue
+                last = closes[-1]
+                prev = closes[-2]
+                ret_1d = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
+                ret_5d = ((last - closes[0]) / closes[0] * 100.0) if closes[0] > 0 else 0.0
+                vol_today = vols[-1] if vols else 0
+                vol_avg = sum(vols) / len(vols) if vols else 1
+                vol_ratio = vol_today / max(vol_avg, 1)
+                summary_rows.append(
+                    f"  {sym}: price={last:.4f}, 1d={ret_1d:+.2f}%, 5d={ret_5d:+.2f}%, vol_ratio={vol_ratio:.2f}x"
+                )
+            except Exception:
                 continue
-            last = closes[-1]
-            prev = closes[-2]
-            ret_1d = ((last - prev) / prev * 100.0) if prev > 0 else 0.0
-            ret_5d = ((last - closes[0]) / closes[0] * 100.0) if closes[0] > 0 else 0.0
-            vol_today = vols[-1] if vols else 0
-            vol_avg = sum(vols) / len(vols) if vols else 1
-            vol_ratio = vol_today / max(vol_avg, 1)
-            summary_rows.append(
-                f"  {sym}: price={last:.4f}, 1d={ret_1d:+.2f}%, 5d={ret_5d:+.2f}%, vol_ratio={vol_ratio:.2f}x"
-            )
-        except Exception:
-            continue
 
     if not summary_rows:
         return ""
@@ -156,15 +180,26 @@ def build_ai_prompt(
     rule_based_signals: list[dict[str, Any]] | None = None,
     market_context: str = "",
 ) -> str:
-    max_pos = float(risk_policy.get("maxPositionSizePct", 8.0))
+    max_pos_by_segment = risk_policy.get("maxPositionSizePctBySegment", {})
+    max_pos = float(max_pos_by_segment.get(segment, risk_policy.get("maxPositionSizePct", 8.0))) if isinstance(max_pos_by_segment, dict) else float(risk_policy.get("maxPositionSizePct", 8.0))
     max_open = int(risk_policy.get("maxOpenPositions", 15))
     stop_loss = float(risk_policy.get("stopLossPct", 2.2))
     tp1 = float((risk_policy.get("exitHooks") or {}).get("firstTargetPct", 3.0))
     tp2 = float((risk_policy.get("exitHooks") or {}).get("secondTargetPct", 6.0))
     ai_cfg = risk_policy.get("aiScheduler", {})
-    min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
-    min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
-    min_net_edge = float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
+    min_conf_by_segment = ai_cfg.get("minConfidenceForBuyBySegment", {})
+    min_edge_by_segment = ai_cfg.get("minExpectedEdgeForBuyBySegment", {})
+    min_net_edge_by_segment = ai_cfg.get("minExpectedEdgeNetForBuyBySegment", {})
+    min_conf = float(min_conf_by_segment.get(segment, ai_cfg.get("minConfidenceForBuy", 0.70))) if isinstance(min_conf_by_segment, dict) else float(ai_cfg.get("minConfidenceForBuy", 0.70))
+    min_edge = float(min_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeForBuy", 0.05))) if isinstance(min_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+    min_net_edge = float(min_net_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))) if isinstance(min_net_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
+    trailing_stop = float((risk_policy.get("exitHooks") or {}).get("trailingStopPct", 1.8))
+    segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
+    est_spread_bps = float(segment_cfg.get("maxSpreadBps", 40)) * 0.35
+    est_slippage_bps = float(
+        ai_cfg.get("slippageBufferBpsCrypto", 12.0) if segment == "crypto" else ai_cfg.get("slippageBufferBpsStocks", 6.0)
+    )
+    est_cost_bps = est_spread_bps + est_slippage_bps
 
     rule_context = ""
     if rule_based_signals:
@@ -185,7 +220,7 @@ Allowed symbols: {", ".join(allowed_symbols)}
 Baseline hard stop-loss: -{stop_loss:.2f}%
 First target: +{tp1:.2f}% -> scale out 40%
 Second target: +{tp2:.2f}% -> scale out another 30%
-Trailing stop: 1.8%
+Trailing stop: {trailing_stop:.1f}%
 
 {rule_context}
 
@@ -194,6 +229,7 @@ Trailing stop: 1.8%
 Strict rules for LIVE trading:
 - Only BUY if you see a clear, realistic positive edge AFTER accounting for spreads/slippage (pennies often have 5-20% effective spreads).
 - Confidence must be >= {min_conf:.2f} and expected_edge >= {min_edge:.2f} for any BUY.
+- Estimated execution costs for this segment are ~{est_cost_bps:.0f} bps. After subtracting these costs, the net expected_edge must be >= {min_net_edge:.4f}. Target a gross edge well above {min_edge:.2f} to clear this hurdle.
 - If edge is marginal or market looks choppy/manipulated, return HOLD.
 - Never exceed position limits or use symbols outside allowlist.
 - For penny stocks, be extra skeptical of volume spikes without fundamental/news catalyst.
@@ -381,9 +417,12 @@ def validate_and_plan_signal(
         return AiSignalDecision(False, f"Symbol '{symbol}' not allowed for segment '{segment}'.", normalized, None)
 
     ai_cfg = risk_policy.get("aiScheduler", {})
-    min_conf = float(ai_cfg.get("minConfidenceForBuy", 0.70))
-    min_edge = float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
-    min_net_edge = float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
+    min_conf_by_segment = ai_cfg.get("minConfidenceForBuyBySegment", {})
+    min_edge_by_segment = ai_cfg.get("minExpectedEdgeForBuyBySegment", {})
+    min_net_edge_by_segment = ai_cfg.get("minExpectedEdgeNetForBuyBySegment", {})
+    min_conf = float(min_conf_by_segment.get(segment, ai_cfg.get("minConfidenceForBuy", 0.70))) if isinstance(min_conf_by_segment, dict) else float(ai_cfg.get("minConfidenceForBuy", 0.70))
+    min_edge = float(min_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeForBuy", 0.05))) if isinstance(min_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
+    min_net_edge = float(min_net_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))) if isinstance(min_net_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
     if confidence < min_conf:
         return AiSignalDecision(False, "Signal does not pass confidence threshold.", normalized, None)
 
@@ -391,7 +430,8 @@ def validate_and_plan_signal(
     if len(open_positions) >= max_open and decision == "BUY":
         return AiSignalDecision(False, "Max open positions reached.", normalized, None)
 
-    max_size_pct = float(risk_policy.get("maxPositionSizePct", 12.0))
+    max_size_by_segment = risk_policy.get("maxPositionSizePctBySegment", {})
+    max_size_pct = float(max_size_by_segment.get(segment, risk_policy.get("maxPositionSizePct", 12.0))) if isinstance(max_size_by_segment, dict) else float(risk_policy.get("maxPositionSizePct", 12.0))
     if size_pct <= 0 or size_pct > max_size_pct:
         return AiSignalDecision(False, f"Position size pct {size_pct:.2f} exceeds policy max {max_size_pct:.2f}.", normalized, None)
 
@@ -399,8 +439,18 @@ def validate_and_plan_signal(
     if equity <= 0:
         equity = budget
     alloc = min(budget * (size_pct / 100.0), equity * (size_pct / 100.0))
+    max_notional_by_segment = risk_policy.get("maxOrderNotionalUsdBySegment", {})
+    min_notional_by_segment = risk_policy.get("minOrderNotionalUsdBySegment", {})
+    max_notional_global = float(risk_policy.get("maxOrderNotionalUsd", 0.0))
+    min_notional_global = float(risk_policy.get("minOrderNotionalUsd", 0.0))
+    max_notional = float(max_notional_by_segment.get(segment, max_notional_global)) if isinstance(max_notional_by_segment, dict) else max_notional_global
+    min_notional = float(min_notional_by_segment.get(segment, min_notional_global)) if isinstance(min_notional_by_segment, dict) else min_notional_global
+    if max_notional > 0:
+        alloc = min(alloc, max_notional)
     if alloc <= 0:
         return AiSignalDecision(False, "Calculated allocation is zero.", normalized, None)
+    if min_notional > 0 and alloc < min_notional:
+        return AiSignalDecision(False, f"Allocation ${alloc:.2f} below min notional ${min_notional:.2f}.", normalized, None)
 
     latest_price = client.get_latest_price(symbol)
     if latest_price is None or latest_price <= 0:
@@ -475,14 +525,27 @@ def run_ai_cycle(
     segment: str,
     budget: float,
     execute: bool,
+    combined_equity: float | None = None,
 ) -> dict[str, Any]:
+    policy_effective = deepcopy(risk_policy)
+    fear_state = load_fear_climate_state()
+    fear_active = segment == "crypto" and bool(fear_state.get("enabled", False))
+    fear_meta: dict[str, Any] = {"enabled": fear_active}
+    if fear_active:
+        fear_meta = apply_fear_climate_overrides(policy_effective, segment="crypto")
+
     account_snapshot = client.get_account()
-    equity_mode = apply_equity_mode_switch(risk_policy, account=account_snapshot)
-    ai_cfg = risk_policy.get("aiScheduler", {})
+    if combined_equity is not None:
+        account_snapshot = dict(account_snapshot)
+        account_snapshot["equity"] = combined_equity
+    equity_mode = apply_equity_mode_switch(policy_effective, account=account_snapshot)
+    ai_cfg = policy_effective.get("aiScheduler", {})
     timeout_seconds = int(ai_cfg.get("aiTimeoutSeconds", ai_cfg.get("openclawTimeoutSeconds", 35)))
-    segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
+    segment_cfg = (policy_effective.get("allowedSegments") or {}).get(segment, {})
     base_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
-    discovery_cfg = risk_policy.get("marketDiscovery", {})
+    discovery_cfg = policy_effective.get("marketDiscovery", {})
+    from .kraken_client import KrakenClient as _KC
+    _kc = client if isinstance(client, _KC) else None
     if bool(discovery_cfg.get("enabled", False)):
         top_n = int(discovery_cfg.get("topCandidatesPerSegment", 20))
         allowed_symbols = discover_segment_candidates(
@@ -490,6 +553,7 @@ def run_ai_cycle(
             base_symbols=list(base_symbols),
             top_n=top_n,
             discovery_cfg=discovery_cfg,
+            kraken_client=_kc,
         )
     else:
         allowed_symbols = list(base_symbols)
@@ -502,6 +566,7 @@ def run_ai_cycle(
             "ai_used": False,
             "reason": f"Budget below AI min threshold ({min_budget}).",
             "equity_mode": equity_mode,
+            "fear_climate": fear_meta,
         }
     if not allowed_symbols:
         return {
@@ -511,11 +576,13 @@ def run_ai_cycle(
             "ai_used": False,
             "reason": "No symbols configured for segment.",
             "equity_mode": equity_mode,
+            "fear_climate": fear_meta,
         }
 
-    # Optional pre-run cleanup to avoid cash lockup from stale buy orders.
-    stale_minutes = int(risk_policy.get("cancelOpenOrdersAfterMinutes", 20))
-    cancel_open_before_run = bool(risk_policy.get("cancelOpenOrdersBeforeRun", True))
+    # Optional pre-run cleanup — only cancel stale buys from the *current* segment
+    # so that, e.g., an indexFunds cycle doesn't kill a crypto limit buy.
+    stale_minutes = int(policy_effective.get("cancelOpenOrdersAfterMinutes", 20))
+    cancel_open_before_run = bool(policy_effective.get("cancelOpenOrdersBeforeRun", True))
     cancelled_order_ids: list[str] = []
     if execute and cancel_open_before_run and stale_minutes > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
@@ -523,6 +590,11 @@ def run_ai_cycle(
             open_orders = client.get_orders(status="open", limit=200, direction="desc")
             for order in open_orders:
                 if str(order.get("side", "")).lower() != "buy":
+                    continue
+                order_sym = str(order.get("symbol", ""))
+                order_is_crypto = "/" in order_sym
+                running_is_crypto = segment == "crypto"
+                if order_is_crypto != running_is_crypto:
                     continue
                 order_id = order.get("id")
                 if not order_id:
@@ -546,7 +618,7 @@ def run_ai_cycle(
     try:
         preview = run_once(
             client=client,
-            risk_policy=risk_policy,
+            risk_policy=policy_effective,
             segment=segment,
             budget=budget,
             execute=False,
@@ -564,13 +636,15 @@ def run_ai_cycle(
         market_context = (
             f"Rule engine context: universe_size={preview.get('universe_size', 0)}, "
             f"symbols_with_data={preview.get('symbols_with_data', 0)}, "
-            f"signals_considered={preview.get('signals_considered', 0)}.\n" + fetch_market_context(allowed_symbols, segment)
+            f"signals_considered={preview.get('signals_considered', 0)}.\n" + fetch_market_context(allowed_symbols, segment, client=client, risk_policy=risk_policy)
         )
     except Exception:
         rule_based_signals = []
         market_context = ""
 
-    prefilter_threshold = float(ai_cfg.get("prefilterScoreThreshold", 0.035))
+    global_prefilter = float(ai_cfg.get("prefilterScoreThreshold", 0.035))
+    per_segment_pf = ai_cfg.get("prefilterScoreThresholdBySegment", {})
+    prefilter_threshold = float(per_segment_pf.get(segment, global_prefilter)) if isinstance(per_segment_pf, dict) else global_prefilter
     best_prefilter_score = _best_rule_prefilter_score(rule_based_signals)
     if best_prefilter_score < prefilter_threshold:
         if preview is None:
@@ -606,7 +680,7 @@ def run_ai_cycle(
         signal=signal,
         budget=budget,
         segment=segment,
-        risk_policy=risk_policy,
+        risk_policy=policy_effective,
         account=account,
         open_positions=positions,
         client=client,
@@ -644,5 +718,6 @@ def run_ai_cycle(
         "orders_placed": [placed] if placed else [],
         "order_errors": ([{"symbol": decision.planned_order.get("symbol"), "error": place_error}] if place_error and decision.planned_order else []),
         "equity_mode": equity_mode,
+        "fear_climate": fear_meta,
     }
 

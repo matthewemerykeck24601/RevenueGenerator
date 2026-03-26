@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 from .alpaca_client import AlpacaClient
 from .equity_mode import apply_equity_mode_switch
 from .external_research import discover_segment_candidates, select_external_candidates, should_skip_cycle_for_vix
+from .fear_climate import apply_fear_climate_overrides, load_fear_climate_state
 from .risk import evaluate_risk
 from .strategy import Signal, select_top_signals
 
@@ -67,18 +69,9 @@ def _bars_from_stock_snapshots(snapshots: dict[str, Any]) -> dict[str, list[dict
 
 
 def _yahoo_symbol(symbol: str) -> str:
-    crypto_map = {
-        "BTC/USD": "BTC-USD",
-        "ETH/USD": "ETH-USD",
-        "SOL/USD": "SOL-USD",
-        "AVAX/USD": "AVAX-USD",
-        "LTC/USD": "LTC-USD",
-        "LINK/USD": "LINK-USD",
-        "BCH/USD": "BCH-USD",
-        "UNI/USD": "UNI-USD",
-        "AAVE/USD": "AAVE-USD",
-    }
-    return crypto_map.get(symbol, symbol)
+    if "/" in symbol:
+        return symbol.replace("/", "-")
+    return symbol
 
 
 def _fetch_yfinance_daily_bars(symbols: list[str], limit: int = 40) -> dict[str, list[dict[str, float]]]:
@@ -111,6 +104,29 @@ def _fetch_yfinance_daily_bars(symbols: list[str], limit: int = 40) -> dict[str,
     return out
 
 
+def _fear_benchmark_risk_off(
+    bars_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    required_symbols: tuple[str, str] = ("BTC/USD", "ETH/USD"),
+    lookback_bars: int = 3,
+    min_return_pct: float = -0.15,
+) -> tuple[bool, dict[str, float]]:
+    rets: dict[str, float] = {}
+    for symbol in required_symbols:
+        bars = bars_by_symbol.get(symbol) or []
+        if len(bars) <= lookback_bars:
+            continue
+        now_c = float(bars[-1].get("c", 0.0) or 0.0)
+        prev_c = float(bars[-(lookback_bars + 1)].get("c", 0.0) or 0.0)
+        if now_c <= 0 or prev_c <= 0:
+            continue
+        rets[symbol] = (now_c - prev_c) / prev_c * 100.0
+    if len(rets) < len(required_symbols):
+        return False, rets
+    risk_off = all(ret <= min_return_pct for ret in rets.values())
+    return risk_off, rets
+
+
 def build_orders(
     *,
     signals: list[Signal],
@@ -119,15 +135,28 @@ def build_orders(
     current_equity: float,
     open_positions: int,
     risk_policy: dict[str, Any],
+    segment: str = "",
 ) -> list[PlannedOrder]:
     max_open_positions = int(risk_policy.get("maxOpenPositions", 5))
     max_daily_loss_pct = float(risk_policy.get("maxDailyLossPct", 2.0))
-    max_position_size_pct = float(risk_policy.get("maxPositionSizePct", 10.0))
+    max_pos_by_segment = risk_policy.get("maxPositionSizePctBySegment", {})
+    max_position_size_pct = float(max_pos_by_segment.get(segment, risk_policy.get("maxPositionSizePct", 10.0))) if isinstance(max_pos_by_segment, dict) else float(risk_policy.get("maxPositionSizePct", 10.0))
     allow_fractional_stocks = bool(risk_policy.get("allowFractionalStocks", True))
-    min_expected_edge_net = float(risk_policy.get("minExpectedEdgeNet", 0.0))
+    min_edge_net_by_segment = risk_policy.get("minExpectedEdgeNetBySegment", {})
+    min_expected_edge_net = float(min_edge_net_by_segment.get(segment, risk_policy.get("minExpectedEdgeNet", 0.0))) if isinstance(min_edge_net_by_segment, dict) else float(risk_policy.get("minExpectedEdgeNet", 0.0))
     ai_cfg = risk_policy.get("aiScheduler", {})
     stock_slippage_bps = float(ai_cfg.get("slippageBufferBpsStocks", 6.0))
     crypto_slippage_bps = float(ai_cfg.get("slippageBufferBpsCrypto", 12.0))
+    global_discount_pct = float(risk_policy.get("limitPriceDiscountPct", 0.2))
+    per_segment_discount = risk_policy.get("limitPriceDiscountPctBySegment", {})
+    discount_pct = float(per_segment_discount.get(segment, global_discount_pct)) if isinstance(per_segment_discount, dict) else global_discount_pct
+    limit_multiplier = 1.0 - (discount_pct / 100.0)
+    min_notional_by_segment = risk_policy.get("minOrderNotionalUsdBySegment", {})
+    max_notional_by_segment = risk_policy.get("maxOrderNotionalUsdBySegment", {})
+    min_notional_global = float(risk_policy.get("minOrderNotionalUsd", 0.0))
+    max_notional_global = float(risk_policy.get("maxOrderNotionalUsd", 0.0))
+    min_order_notional = float(min_notional_by_segment.get(segment, min_notional_global)) if isinstance(min_notional_by_segment, dict) else min_notional_global
+    max_order_notional = float(max_notional_by_segment.get(segment, max_notional_global)) if isinstance(max_notional_by_segment, dict) else max_notional_global
 
     orders: list[PlannedOrder] = []
     remaining_budget = budget
@@ -153,6 +182,10 @@ def build_orders(
             break
 
         allowed_alloc = min(decision.max_alloc_dollars, remaining_budget)
+        if max_order_notional > 0:
+            allowed_alloc = min(allowed_alloc, max_order_notional)
+        if allowed_alloc <= 0:
+            continue
         is_crypto = "/" in sig.symbol
         qty: float | int
         if is_crypto:
@@ -170,9 +203,10 @@ def build_orders(
             if qty < 1:
                 continue
 
-        # Slight discount below last for better fill quality.
-        limit_price = _round_limit(sig.last_price * 0.998)
+        limit_price = _round_limit(sig.last_price * limit_multiplier)
         used_alloc = qty * limit_price
+        if used_alloc < min_order_notional:
+            continue
         remaining_budget -= used_alloc
         if remaining_budget <= 0:
             break
@@ -202,18 +236,39 @@ def run_once(
     if segment not in SEGMENT_UNIVERSE:
         raise ValueError(f"Unsupported segment '{segment}'. Choose from: {', '.join(SEGMENT_UNIVERSE)}")
 
+    policy_effective = deepcopy(risk_policy)
+    fear_state = load_fear_climate_state()
+    fear_active = segment == "crypto" and bool(fear_state.get("enabled", False))
+    fear_meta: dict[str, Any] = {"enabled": fear_active}
+    if fear_active:
+        fear_meta = apply_fear_climate_overrides(policy_effective, segment="crypto")
+
     account = client.get_account()
     positions = client.get_open_positions()
-    equity_mode = apply_equity_mode_switch(risk_policy, account=account)
+    equity_mode = apply_equity_mode_switch(policy_effective, account=account)
     start_equity = float(account.get("last_equity", account.get("equity", "0")))
     current_equity = float(account.get("equity", "0"))
 
-    segment_cfg = risk_policy.get("allowedSegments", {}).get(segment, {})
+    segment_cfg = policy_effective.get("allowedSegments", {}).get(segment, {})
     if not segment_cfg.get("enabled", True):
-        return {"orders": [], "reason": f"Segment '{segment}' disabled in risk policy.", "equity_mode": equity_mode}
+        return {"orders": [], "reason": f"Segment '{segment}' disabled in risk policy.", "equity_mode": equity_mode, "fear_climate": fear_meta}
+    if fear_active and segment == "crypto" and bool(policy_effective.get("fearPauseNewBuysCrypto", False)):
+        return {
+            "strategy": "rule_engine",
+            "account_status": account.get("status"),
+            "segment": segment,
+            "budget": budget,
+            "execute": execute,
+            "reason": "Fear climate mode is ON: new crypto buys are paused.",
+            "orders_planned": [],
+            "orders_placed": [],
+            "order_errors": [],
+            "equity_mode": equity_mode,
+            "fear_climate": fear_meta,
+        }
 
     universe = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE[segment]
-    external_cfg = risk_policy.get("externalResearch", {})
+    external_cfg = policy_effective.get("externalResearch", {})
     if external_cfg.get("enabled", True):
         regime_vix_ceiling = float(external_cfg.get("riskOffVixCeiling", 25.0))
         risk_off_segments = external_cfg.get("riskOffSegments", ["pennyStocks"])
@@ -237,15 +292,19 @@ def run_once(
                 "orders_placed": [],
                 "order_errors": [],
                 "equity_mode": equity_mode,
+                "fear_climate": fear_meta,
             }
-    discovery_cfg = risk_policy.get("marketDiscovery", {})
+    discovery_cfg = policy_effective.get("marketDiscovery", {})
     if bool(discovery_cfg.get("enabled", False)):
         top_n = int(discovery_cfg.get("topCandidatesPerSegment", external_cfg.get("topCandidatesPerSegment", 20)))
+        from .kraken_client import KrakenClient as _KC
+        _kc = client if isinstance(client, _KC) else None
         universe = discover_segment_candidates(
             segment=segment,
             base_symbols=list(universe),
             top_n=top_n,
             discovery_cfg=discovery_cfg,
+            kraken_client=_kc,
         )
     elif external_cfg.get("enabled", True):
         top_n = int(external_cfg.get("topCandidatesPerSegment", 12))
@@ -257,12 +316,14 @@ def run_once(
             regime_vix_ceiling=regime_vix_ceiling,
         )
     max_spread_bps = float(segment_cfg.get("maxSpreadBps", 40))
-    min_confidence = float(risk_policy.get("minSignalConfidence", 0.5))
-    min_expected_edge = float(risk_policy.get("minExpectedEdge", 0.0))
+    min_conf_by_segment = policy_effective.get("minSignalConfidenceBySegment", {})
+    min_edge_by_segment = policy_effective.get("minExpectedEdgeBySegment", {})
+    min_confidence = float(min_conf_by_segment.get(segment, policy_effective.get("minSignalConfidence", 0.5))) if isinstance(min_conf_by_segment, dict) else float(policy_effective.get("minSignalConfidence", 0.5))
+    min_expected_edge = float(min_edge_by_segment.get(segment, policy_effective.get("minExpectedEdge", 0.0))) if isinstance(min_edge_by_segment, dict) else float(policy_effective.get("minExpectedEdge", 0.0))
     max_signals = int(segment_cfg.get("maxSignals", 3))
 
-    stale_minutes = int(risk_policy.get("cancelOpenOrdersAfterMinutes", 20))
-    cancel_open_before_run = bool(risk_policy.get("cancelOpenOrdersBeforeRun", True))
+    stale_minutes = int(policy_effective.get("cancelOpenOrdersAfterMinutes", 20))
+    cancel_open_before_run = bool(policy_effective.get("cancelOpenOrdersBeforeRun", True))
     cancelled_order_ids: list[str] = []
     if execute and cancel_open_before_run and stale_minutes > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
@@ -270,6 +331,11 @@ def run_once(
             open_orders = client.get_orders(status="open", limit=200, direction="desc")
             for order in open_orders:
                 if str(order.get("side", "")).lower() != "buy":
+                    continue
+                order_sym = str(order.get("symbol", ""))
+                order_is_crypto = "/" in order_sym
+                running_is_crypto = segment == "crypto"
+                if order_is_crypto != running_is_crypto:
                     continue
                 order_id = order.get("id")
                 if not order_id:
@@ -282,14 +348,14 @@ def run_once(
                         client.cancel_order(str(order_id))
                         cancelled_order_ids.append(str(order_id))
                     except Exception:
-                        # Keep cycle alive if one cancel fails.
                         pass
         except Exception:
-            # Keep cycle alive if orders lookup fails.
             pass
 
     if segment == "crypto":
-        bars = client.get_crypto_bars(universe, timeframe="1Hour", limit=80)
+        crypto_tf = str(segment_cfg.get("timeframe", policy_effective.get("cryptoSignalTimeframe", "5Min")))
+        crypto_limit = int(segment_cfg.get("barsLimit", policy_effective.get("cryptoBarsLimit", 120)))
+        bars = client.get_crypto_bars(universe, timeframe=crypto_tf, limit=crypto_limit)
     elif segment in ("largeCapStocks", "indexFunds"):
         bars = client.get_stock_bars(universe, timeframe="1Day", limit=40)
         # Alpaca can occasionally return only the latest bar for some symbols/feeds.
@@ -305,17 +371,48 @@ def run_once(
         bars = _bars_from_stock_snapshots(snapshots)
 
     bars_with_data = {sym: v for sym, v in bars.items() if v}
+    if fear_active and segment == "crypto":
+        fear_cfg = policy_effective.get("fearClimateMode", {})
+        crypto_fear_cfg = fear_cfg.get("crypto", {}) if isinstance(fear_cfg, dict) else {}
+        if bool(crypto_fear_cfg.get("benchmarkGateEnabled", True)):
+            lookback_bars = int(crypto_fear_cfg.get("benchmarkLookbackBars", 3))
+            min_ret_pct = float(crypto_fear_cfg.get("benchmarkMinReturnPct", -0.15))
+            risk_off, benchmark_returns = _fear_benchmark_risk_off(
+                bars_with_data,
+                lookback_bars=lookback_bars,
+                min_return_pct=min_ret_pct,
+            )
+            fear_meta["benchmark_returns_pct"] = benchmark_returns
+            fear_meta["benchmark_risk_off"] = risk_off
+            if risk_off:
+                return {
+                    "strategy": "rule_engine",
+                    "account_status": account.get("status"),
+                    "segment": segment,
+                    "budget": budget,
+                    "execute": execute,
+                    "reason": "Fear climate benchmark gate blocked crypto entries.",
+                    "orders_planned": [],
+                    "orders_placed": [],
+                    "order_errors": [],
+                    "equity_mode": equity_mode,
+                    "fear_climate": fear_meta,
+                }
 
     # Duplicate/add-on controls:
     # - default mode: skip held + recently bought symbols
     # - aggressive mode: allow add-on buys with per-symbol cap and short cooldown
     held_symbols = {p.get("symbol") for p in positions if p.get("symbol")}
-    cooldown_minutes = int(risk_policy.get("buyCooldownMinutes", 180))
+    cooldown_by_segment = policy_effective.get("buyCooldownMinutesBySegment", {})
+    cooldown_minutes = int(cooldown_by_segment.get(segment, policy_effective.get("buyCooldownMinutes", 180))) if isinstance(cooldown_by_segment, dict) else int(policy_effective.get("buyCooldownMinutes", 180))
     cooldown_cutoff = datetime.now(timezone.utc) - timedelta(minutes=cooldown_minutes)
-    allow_add_on_buys = bool(risk_policy.get("allowAddOnBuys", False))
-    max_entries_per_symbol = int(risk_policy.get("maxEntriesPerSymbol", 3))
-    add_on_cooldown_minutes = int(risk_policy.get("addOnBuyCooldownMinutes", 8))
-    entry_lookback_hours = int(risk_policy.get("entryCountLookbackHours", 48))
+    allow_add_on_buys = bool(policy_effective.get("allowAddOnBuys", False))
+    max_entries_by_segment = policy_effective.get("maxEntriesPerSymbolBySegment", {})
+    max_entries_per_symbol = int(max_entries_by_segment.get(segment, policy_effective.get("maxEntriesPerSymbol", 3))) if isinstance(max_entries_by_segment, dict) else int(policy_effective.get("maxEntriesPerSymbol", 3))
+    add_on_cd_by_segment = policy_effective.get("addOnBuyCooldownMinutesBySegment", {})
+    add_on_cooldown_minutes = int(add_on_cd_by_segment.get(segment, policy_effective.get("addOnBuyCooldownMinutes", 8))) if isinstance(add_on_cd_by_segment, dict) else int(policy_effective.get("addOnBuyCooldownMinutes", 8))
+    entry_lookback_by_segment = policy_effective.get("entryCountLookbackHoursBySegment", {})
+    entry_lookback_hours = int(entry_lookback_by_segment.get(segment, policy_effective.get("entryCountLookbackHours", 48))) if isinstance(entry_lookback_by_segment, dict) else int(policy_effective.get("entryCountLookbackHours", 48))
     add_on_cooldown_cutoff = datetime.now(timezone.utc) - timedelta(minutes=add_on_cooldown_minutes)
     entry_lookback_cutoff = datetime.now(timezone.utc) - timedelta(hours=entry_lookback_hours)
     recently_bought: set[str] = set()
@@ -367,18 +464,27 @@ def run_once(
         start_equity=start_equity,
         current_equity=current_equity,
         open_positions=len(positions),
-        risk_policy=risk_policy,
+        risk_policy=policy_effective,
+        segment=segment,
     )
 
     placed: list[dict[str, Any]] = []
     order_errors: list[dict[str, Any]] = []
     if execute:
-        tp_pct = float(risk_policy.get("takeProfitPct", 4.5))
-        sl_pct = float(risk_policy.get("stopLossPct", 2.2))
-        equity_brackets_enabled = bool(risk_policy.get("equityBracketsEnabled", False))
+        tp_by_segment = policy_effective.get("takeProfitPctBySegment", {})
+        sl_by_segment = policy_effective.get("stopLossPctBySegment", {})
+        tp_pct = float(tp_by_segment.get(segment, policy_effective.get("takeProfitPct", 4.5))) if isinstance(tp_by_segment, dict) else float(policy_effective.get("takeProfitPct", 4.5))
+        sl_pct = float(sl_by_segment.get(segment, policy_effective.get("stopLossPct", 2.2))) if isinstance(sl_by_segment, dict) else float(policy_effective.get("stopLossPct", 2.2))
+        equity_brackets_enabled = bool(policy_effective.get("equityBracketsEnabled", False))
+        order_defaults = (policy_effective.get("orderDefaults") or {})
+        segment_order_defaults = order_defaults.get("crypto" if segment == "crypto" else "stocks", {})
+        default_order_type = str(segment_order_defaults.get("type", "limit")).lower()
+        if default_order_type not in {"limit", "market"}:
+            default_order_type = "limit"
+        default_tif = str(segment_order_defaults.get("timeInForce", "gtc" if segment == "crypto" else "day")).lower()
         for order in orders:
             side = "buy"
-            tif = "gtc" if segment == "crypto" else "day"
+            tif = default_tif
             tp, sl = _price_targets(order.limit_price, tp_pct, sl_pct)
             use_bracket = segment != "crypto" and equity_brackets_enabled
             try:
@@ -387,9 +493,9 @@ def run_once(
                         symbol=order.symbol,
                         qty=order.qty,
                         side=side,
-                        order_type="limit",
+                        order_type=default_order_type,
                         tif=tif,
-                        limit_price=order.limit_price,
+                        limit_price=order.limit_price if default_order_type == "limit" else None,
                         take_profit_price=tp if use_bracket else None,
                         stop_loss_price=sl if use_bracket else None,
                     )
@@ -411,4 +517,5 @@ def run_once(
         "order_errors": order_errors,
         "execute": execute,
         "equity_mode": equity_mode,
+        "fear_climate": fear_meta,
     }

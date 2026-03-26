@@ -1,7 +1,23 @@
 {
   "version": "1.0.0",
+  "cryptoBroker": "kraken",
   "maxDailyLossPct": 3.0,
   "maxDrawdownPct": 10.0,
+  "fearClimateMode": {
+    "crypto": {
+      "benchmarkGateEnabled": true,
+      "pauseNewBuys": true,
+      "benchmarkLookbackBars": 3,
+      "benchmarkMinReturnPct": -0.15,
+      "minSignalConfidence": 0.52,
+      "minExpectedEdgeNet": 0.003,
+      "maxSignals": 4,
+      "maxEntriesPerSymbol": 12,
+      "buyCooldownMinutes": 5,
+      "addOnBuyCooldownMinutes": 3,
+      "maxPositionSizePct": 8.0
+    }
+  },
   "maxPositionSizePct": 12.0,
   "allowFractionalStocks": true,
   "equityModeSwitch": {
@@ -14,8 +30,8 @@
       "maxOpenPositions": 20,
       "aiMinConfidenceForBuy": 0.5,
       "aiMinExpectedEdgeForBuy": 0.0,
-      "aiMinExpectedEdgeNetForBuy": 0.003,
-      "minExpectedEdgeNet": 0.003,
+      "aiMinExpectedEdgeNetForBuy": 0.002,
+      "minExpectedEdgeNet": 0.002,
       "allowAddOnBuys": true,
       "sectorBudgetPct": {
         "largeCapStocks": 45,
@@ -30,8 +46,8 @@
       "maxOpenPositions": 28,
       "aiMinConfidenceForBuy": 0.5,
       "aiMinExpectedEdgeForBuy": 0.0,
-      "aiMinExpectedEdgeNetForBuy": 0.003,
-      "minExpectedEdgeNet": 0.003,
+      "aiMinExpectedEdgeNetForBuy": 0.002,
+      "minExpectedEdgeNet": 0.002,
       "allowAddOnBuys": true,
       "exitHooks": {
         "firstTargetPct": 2.2,
@@ -49,17 +65,62 @@
     }
   },
   "maxOpenPositions": 20,
+  "maxPositionSizePctBySegment": {
+    "crypto": 12.0
+  },
+  "minOrderNotionalUsdBySegment": {
+    "crypto": 250.0
+  },
+  "maxOrderNotionalUsdBySegment": {
+    "crypto": 650.0
+  },
   "buyCooldownMinutes": 20,
+  "buyCooldownMinutesBySegment": {
+    "crypto": 2
+  },
   "allowAddOnBuys": true,
   "maxEntriesPerSymbol": 2,
+  "maxEntriesPerSymbolBySegment": {
+    "crypto": 60
+  },
   "addOnBuyCooldownMinutes": 12,
+  "addOnBuyCooldownMinutesBySegment": {
+    "crypto": 1
+  },
   "entryCountLookbackHours": 48,
+  "entryCountLookbackHoursBySegment": {
+    "crypto": 24
+  },
+  "maxHoldMinutesBySegment": {
+    "crypto": 20
+  },
+  "maxHoldExitMinPnlPctBySegment": {
+    "crypto": 0.08
+  },
   "cancelOpenOrdersBeforeRun": true,
-  "cancelOpenOrdersAfterMinutes": 15,
+  "cancelOpenOrdersAfterMinutes": 10,
+  "limitPriceDiscountPct": 0.2,
+  "limitPriceDiscountPctBySegment": {
+    "crypto": 0.0,
+    "indexFunds": 0.05,
+    "largeCapStocks": 0.05,
+    "pennyStocks": 0.3
+  },
   "equityBracketsEnabled": false,
   "minSignalConfidence": 0.4,
+  "minSignalConfidenceBySegment": {
+    "crypto": 0.35
+  },
   "minExpectedEdge": 0.0,
-  "minExpectedEdgeNet": 0.003,
+  "minExpectedEdgeBySegment": {
+    "crypto": 0.0
+  },
+  "minExpectedEdgeNet": 0.002,
+  "minExpectedEdgeNetBySegment": {
+    "crypto": 0.0015
+  },
+  "cryptoSignalTimeframe": "5Min",
+  "cryptoBarsLimit": 240,
   "externalResearch": {
     "enabled": true,
     "topCandidatesPerSegment": 20,
@@ -91,13 +152,32 @@
       "largeCapStocks",
       "crypto"
     ],
+    "advisoryOnlySegments": [
+      "crypto"
+    ],
     "fallbackToRuleEngine": true,
     "aiTimeoutSeconds": 45,
     "prefilterScoreThreshold": 0.004,
-    "minBudgetUsd": 50,
+    "prefilterScoreThresholdBySegment": {
+      "crypto": 0.0,
+      "indexFunds": 0.004,
+      "largeCapStocks": 0.004
+    },
+    "minBudgetUsd": 20,
     "minConfidenceForBuy": 0.5,
+    "minConfidenceForBuyBySegment": {
+      "crypto": 0.38
+    },
     "minExpectedEdgeForBuy": 0.0,
-    "minExpectedEdgeNetForBuy": 0.003,
+    "minExpectedEdgeForBuyBySegment": {
+      "crypto": 0.0
+    },
+    "minExpectedEdgeNetForBuy": 0.002,
+    "minExpectedEdgeNetForBuyBySegment": {
+      "crypto": 0.0015
+    },
+    "cryptoContextTimeframe": "15Min",
+    "cryptoContextBars": 16,
     "slippageBufferBpsStocks": 5,
     "slippageBufferBpsCrypto": 10,
     "marketHoursOnly": false,
@@ -115,18 +195,18 @@
   "sectorCadence": {
     "indexFunds": {
       "enabled": true,
-      "intervalSeconds": 300,
+      "intervalSeconds": 180,
       "budgetPct": 35
     },
     "largeCapStocks": {
       "enabled": true,
-      "intervalSeconds": 420,
+      "intervalSeconds": 240,
       "budgetPct": 45
     },
     "crypto": {
       "enabled": true,
-      "intervalSeconds": 600,
-      "budgetPct": 15
+      "intervalSeconds": 45,
+      "budgetPct": 25
     },
     "pennyStocks": {
       "enabled": false,
@@ -136,11 +216,19 @@
   },
   "takeProfitPct": 4.5,
   "stopLossPct": 2.2,
+  "takeProfitPctBySegment": {
+    "crypto": 0.35
+  },
+  "stopLossPctBySegment": {
+    "crypto": 0.9
+  },
   "allowedSegments": {
     "crypto": {
       "enabled": true,
       "maxSpreadBps": 70,
-      "maxSignals": 2,
+      "maxSignals": 12,
+      "timeframe": "5Min",
+      "barsLimit": 240,
       "symbolsAllowlist": [
         "BTC/USD",
         "ETH/USD",
@@ -150,7 +238,17 @@
         "LINK/USD",
         "BCH/USD",
         "UNI/USD",
-        "AAVE/USD"
+        "AAVE/USD",
+        "DOGE/USD",
+        "DOT/USD",
+        "SHIB/USD",
+        "XTZ/USD",
+        "MKR/USD",
+        "GRT/USD",
+        "BAT/USD",
+        "CRV/USD",
+        "SUSHI/USD",
+        "ALGO/USD"
       ]
     },
     "pennyStocks": {
@@ -178,7 +276,7 @@
     "largeCapStocks": {
       "enabled": true,
       "maxSpreadBps": 30,
-      "maxSignals": 2,
+      "maxSignals": 3,
       "symbolsAllowlist": [
         "NVDA",
         "MSFT",
@@ -197,7 +295,7 @@
     "indexFunds": {
       "enabled": true,
       "maxSpreadBps": 15,
-      "maxSignals": 2,
+      "maxSignals": 3,
       "symbolsAllowlist": [
         "SPY",
         "QQQ",
@@ -244,5 +342,17 @@
     "breakEvenBufferPct": 0.2,
     "hardStopLossPct": 1.8,
     "minNotionalExitUsd": 5.0
+  },
+  "exitHooksBySegment": {
+    "crypto": {
+      "firstTargetPct": 0.35,
+      "firstTargetSellPct": 55.0,
+      "secondTargetPct": 0.65,
+      "secondTargetSellPct": 30.0,
+      "trailingStopPct": 0.30,
+      "breakEvenBufferPct": 0.05,
+      "hardStopLossPct": 0.9,
+      "minNotionalExitUsd": 5.0
+    }
   }
 }

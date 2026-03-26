@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +19,19 @@ if str(SRC) not in sys.path:
 from revenue_generator.alpaca_client import AlpacaClient
 from revenue_generator.config import build_runtime_config, ensure_risk_policy
 from revenue_generator.equity_mode import apply_equity_mode_switch
+from revenue_generator.fear_climate import load_fear_climate_state, set_fear_climate_enabled
+from revenue_generator.kraken_client import KrakenClient
 
 app = Flask(__name__)
 cfg = build_runtime_config()
 client = AlpacaClient(cfg=cfg)
 risk_policy = ensure_risk_policy()
+kraken_client: KrakenClient | None = None
+if str(risk_policy.get("cryptoBroker", "")).lower() == "kraken":
+    try:
+        kraken_client = KrakenClient()
+    except Exception:
+        pass
 RESERVE_STATE_PATH = ROOT / "logs" / "reserve_state.json"
 
 
@@ -178,6 +187,7 @@ def _build_dashboard_payload() -> dict[str, Any]:
     policy_effective = deepcopy(risk_policy)
     apply_equity_mode_switch(policy_effective, account=account)
     max_open_positions = int(policy_effective.get("maxOpenPositions", 0))
+    fear_state = load_fear_climate_state()
 
     open_positions: list[dict[str, Any]] = []
     total_market_value = 0.0
@@ -356,6 +366,7 @@ def _build_dashboard_payload() -> dict[str, Any]:
 
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
+        "fear_climate": fear_state,
         "summary": {
             "equity": equity,
             "cash": cash,
@@ -383,6 +394,7 @@ def _build_dashboard_payload() -> dict[str, Any]:
             "reserve_balance": reserve_balance,
             "reserve_target_request": reserve_target_request,
             "deployable_cash": deployable_cash,
+            "fear_climate_enabled": bool(fear_state.get("enabled", False)),
         },
         "open_positions": open_positions,
         "recent_fills": recent_fills,
@@ -433,16 +445,16 @@ LIVE_HTML = """
       .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
       .k { color: var(--muted); font-size: 11px; text-transform: uppercase; }
       .v { margin-top: 5px; font-size: 17px; font-weight: 700; }
-      .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr); gap: 12px; min-height: calc(100vh - 240px); }
-      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; min-height: 0; }
+      .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 12px; min-height: 520px; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
       .panel h2 { margin: 0 0 8px; font-size: 15px; }
       .panelHeader { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 0 0 8px; }
       .panelHeader h2 { margin: 0; }
       .chartMeta { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
-      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
       th, td { padding: 6px; border-bottom: 1px solid #223056; text-align: right; }
       th:first-child, td:first-child { text-align: left; }
-      th { position: sticky; top: 0; z-index: 2; background: #0f1830; }
+      th { background: #0f1830; }
       .good { color: var(--good); }
       .bad { color: var(--bad); }
       .buyRow { background: rgba(25, 211, 159, 0.08); }
@@ -450,10 +462,14 @@ LIVE_HTML = """
       .sideTag { padding: 2px 6px; border-radius: 999px; font-size: 11px; font-weight: 700; display: inline-block; }
       .sideBuy { background: rgba(25, 211, 159, 0.2); color: var(--good); }
       .sideSell { background: rgba(255, 91, 107, 0.2); color: var(--bad); }
-      .leftCol { display: grid; grid-template-rows: minmax(280px, 45%) minmax(220px, 1fr); gap: 12px; min-height: 0; }
-      .rightCol { display: grid; grid-template-rows: minmax(260px, 1fr) minmax(220px, 1fr); gap: 12px; min-height: 0; }
-      .panelBody { flex: 1; min-height: 0; }
-      .scroll { height: 100%; overflow: auto; }
+      .leftCol, .rightCol { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+      .leftCol > .panel:first-child { min-height: 280px; flex: 1.1; }
+      .leftCol > .panel:last-child { min-height: 250px; flex: 1; }
+      .rightCol > .panel:first-child { min-height: 250px; flex: 1; }
+      .rightCol > .panel:last-child { min-height: 320px; flex: 1.1; }
+      .panelBody { flex: 1; min-height: 0; overflow: hidden; }
+      .scroll { height: 100%; overflow: auto; overscroll-behavior: contain; }
+      .scroll thead th { position: sticky; top: 0; z-index: 1; }
       #equityChart { width: 100% !important; height: 100% !important; }
       .segTable { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 11px; }
       .segTable th, .segTable td { border-bottom: 1px solid #223056; padding: 5px; text-align: right; }
@@ -465,8 +481,19 @@ LIVE_HTML = """
       .miniBar { margin-top: 8px; height: 6px; background: #1c2a4f; border-radius: 999px; overflow: hidden; }
       .miniBar > div { height: 100%; background: linear-gradient(90deg, #63a4ff, #35d4a0); width: 0%; }
       @media (max-width: 1200px) {
-        .grid { grid-template-columns: 1fr; min-height: auto; }
-        .leftCol, .rightCol { min-height: auto; }
+        .grid { grid-template-columns: 1fr; min-height: 0; }
+        .leftCol > .panel:first-child,
+        .leftCol > .panel:last-child,
+        .rightCol > .panel:first-child,
+        .rightCol > .panel:last-child { min-height: 280px; }
+      }
+      @media (max-width: 760px) {
+        .metricGrid { grid-template-columns: 1fr; }
+      }
+      .krakenGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .krakenGrid .panel { min-height: 300px; }
+      @media (max-width: 1200px) {
+        .krakenGrid { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -496,14 +523,21 @@ LIVE_HTML = """
           <p class="sub">Auto-refresh every 5s. Chart shows last 60 minutes (1-min points, ET).</p>
         </div>
       </div>
-      <div class="card" style="min-width:360px; margin-bottom:12px;">
+      <div class="card" style="width:min(100%, 420px); margin-bottom:12px;">
         <div class="k">Reserve Controls</div>
-        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <input id="reserveTargetInput" type="number" step="0.01" min="0" placeholder="Reserve request (USD)" style="width:170px; padding:6px;" />
           <button onclick="setReserveTarget()" style="padding:6px 10px;">Set Reserve Request</button>
           <button onclick="recirculateReserves()" style="padding:6px 10px;">Recirculate Reserves</button>
         </div>
         <div id="reserveStatus" style="margin-top:8px; color:var(--muted); font-size:12px;">Reserve pot: -- | Pending request: --</div>
+        <div style="margin-top:10px; border-top:1px solid #223056; padding-top:10px;">
+          <div class="k">Fear Climate Mode (Crypto/Kraken)</div>
+          <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button id="fearToggleBtn" onclick="toggleFearClimate()" style="padding:6px 10px;">Enable Fear Mode</button>
+          </div>
+          <div id="fearClimateStatus" style="margin-top:8px; color:var(--muted); font-size:12px;">Fear mode: --</div>
+        </div>
       </div>
     </div>
 
@@ -562,7 +596,7 @@ LIVE_HTML = """
         </div>
         <div class="panel">
           <h2>Session Metrics</h2>
-          <div class="panelBody">
+          <div class="panelBody scroll">
             <div class="metricGrid">
               <div class="metricItem"><div class="label">Open Positions</div><div class="value" id="mOpenCount">0</div></div>
               <div class="metricItem"><div class="label">Buying Power</div><div class="value" id="mBuyingPower">$0</div></div>
@@ -588,6 +622,49 @@ LIVE_HTML = """
                 <tbody></tbody>
               </table>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="krakenSection" style="margin-top:20px;">
+      <h1 style="margin:0 0 4px; font-size:20px; color:#f7931a;">Kraken Crypto Broker</h1>
+      <p class="sub">Dedicated 24/7 crypto execution via Kraken. Auto-refresh with main dashboard.</p>
+      <div id="krakenStatus" style="color:var(--muted); font-size:13px; margin-bottom:8px;">Loading Kraken data...</div>
+      <div class="cards" id="krakenCards">
+        <div class="card" style="border-color:#f7931a44;"><div class="k">Kraken USD</div><div class="v" id="kUsd">$0</div></div>
+        <div class="card" style="border-color:#f7931a44;"><div class="k">Kraken Equity</div><div class="v" id="kEquity">$0</div></div>
+        <div class="card" style="border-color:#f7931a44;"><div class="k">Free Margin</div><div class="v" id="kMargin">$0</div></div>
+        <div class="card" style="border-color:#f7931a44;"><div class="k">Open Orders</div><div class="v" id="kOpenOrders">0</div></div>
+        <div class="card" style="border-color:#f7931a44;"><div class="k">Filled Trades</div><div class="v" id="kTradeCount">0</div></div>
+      </div>
+      <div class="krakenGrid">
+        <div class="panel" style="border-color:#f7931a33;">
+          <h2 style="color:#f7931a;">Live Prices &amp; Holdings</h2>
+          <div class="panelBody scroll">
+            <table id="krakenPricesTable">
+              <thead><tr><th>Pair</th><th>Price (USD)</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <h3 style="margin:10px 0 4px; font-size:13px; color:#f7931a;">Holdings</h3>
+            <table id="krakenHoldingsTable">
+              <thead><tr><th>Asset</th><th>Qty</th><th>Price</th><th>Value</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel" style="border-color:#f7931a33;">
+          <h2 style="color:#f7931a;">Open Orders &amp; Trades</h2>
+          <div class="panelBody scroll">
+            <table id="krakenOrdersTable">
+              <thead><tr><th>ID</th><th>Description</th><th>Vol</th><th>Filled</th><th>Status</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <h3 style="margin:10px 0 4px; font-size:13px; color:#f7931a;">Recent Trades</h3>
+            <table id="krakenTradesTable">
+              <thead><tr><th>Pair</th><th>Side</th><th>Price</th><th>Vol</th><th>Cost</th><th>Fee</th></tr></thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -704,6 +781,33 @@ LIVE_HTML = """
         await refresh();
       }
 
+      function renderFearClimate(state) {
+        const enabled = !!(state && state.enabled);
+        const btn = document.getElementById("fearToggleBtn");
+        const status = document.getElementById("fearClimateStatus");
+        btn.textContent = enabled ? "Disable Fear Mode" : "Enable Fear Mode";
+        status.textContent = `Fear mode: ${enabled ? "ON (stricter crypto entries)" : "OFF"}`;
+        btn.style.background = enabled ? "#3c1720" : "";
+        btn.style.color = enabled ? "#ffdbe2" : "";
+        btn.style.border = enabled ? "1px solid #7a2635" : "";
+      }
+
+      async function toggleFearClimate() {
+        const btn = document.getElementById("fearToggleBtn");
+        btn.disabled = true;
+        try {
+          const enabled = btn.textContent.toLowerCase().includes("enable");
+          await fetch("/api/fear-climate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled }),
+          });
+          await refresh();
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
       async function triggerKillSwitch() {
         const killStatus = document.getElementById("killStatus");
         killStatus.textContent = "KILL command sent...";
@@ -754,16 +858,184 @@ LIVE_HTML = """
         renderPositions(data.open_positions || []);
         renderFills(data.recent_fills || []);
         renderSessionMetrics(data, s);
+        renderFearClimate(data.fear_climate || {});
         document.getElementById("reserveStatus").textContent =
           `Reserve pot: ${fmt(s.reserve_balance)} | Pending request: ${fmt(s.reserve_target_request)}`;
       }
 
+      async function refreshKraken() {
+        const statusEl = document.getElementById("krakenStatus");
+        let k;
+        try {
+          const resp = await fetch("/api/kraken-dashboard");
+          k = await resp.json();
+        } catch (err) {
+          statusEl.textContent = "Kraken API fetch error: " + err.message;
+          return;
+        }
+        if (!k.available) {
+          statusEl.textContent = "Kraken not available: " + (k.reason || "unknown");
+          return;
+        }
+        statusEl.textContent = "";
+
+        document.getElementById("kUsd").textContent = fmt(k.usd_balance);
+        document.getElementById("kEquity").textContent = fmt(k.equity);
+        document.getElementById("kMargin").textContent = fmt(k.free_margin);
+        document.getElementById("kOpenOrders").textContent = String(k.open_orders.length);
+        document.getElementById("kTradeCount").textContent = String(k.recent_trades.length);
+
+        const priceBody = document.querySelector("#krakenPricesTable tbody");
+        priceBody.innerHTML = "";
+        const pairs = Object.entries(k.live_prices || {}).sort((a, b) => b[1] - a[1]);
+        for (const [pair, price] of pairs) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${pair}</td><td>${price >= 100 ? fmt(price) : "$" + Number(price).toFixed(4)}</td>`;
+          priceBody.appendChild(tr);
+        }
+
+        const holdBody = document.querySelector("#krakenHoldingsTable tbody");
+        holdBody.innerHTML = "";
+        for (const h of k.holdings) {
+          const tr = document.createElement("tr");
+          const priceStr = h.price ? (h.price >= 100 ? fmt(h.price) : "$" + Number(h.price).toFixed(4)) : "--";
+          tr.innerHTML = `<td>${h.symbol || h.asset}</td><td>${Number(h.qty).toFixed(6)}</td><td>${priceStr}</td><td>${fmt(h.value_usd)}</td>`;
+          holdBody.appendChild(tr);
+        }
+
+        const ordBody = document.querySelector("#krakenOrdersTable tbody");
+        ordBody.innerHTML = "";
+        for (const o of k.open_orders) {
+          const tr = document.createElement("tr");
+          const sideClass = o.side === "buy" ? "sideBuy" : "sideSell";
+          tr.innerHTML = `<td style="font-size:10px;">${o.id}</td><td>${o.description}</td><td>${Number(o.volume).toFixed(6)}</td><td>${Number(o.filled).toFixed(6)}</td><td>${o.status}</td>`;
+          ordBody.appendChild(tr);
+        }
+
+        const trBody = document.querySelector("#krakenTradesTable tbody");
+        trBody.innerHTML = "";
+        for (const t of k.recent_trades) {
+          const tr = document.createElement("tr");
+          const sideClass = t.side === "buy" ? "sideBuy" : "sideSell";
+          tr.innerHTML = `<td>${t.pair}</td><td><span class="sideTag ${sideClass}">${t.side.toUpperCase()}</span></td><td>${fmt(t.price)}</td><td>${Number(t.volume).toFixed(6)}</td><td>${fmt(t.cost)}</td><td>${fmt(t.fee)}</td>`;
+          trBody.appendChild(tr);
+        }
+      }
+
       refresh();
+      refreshKraken();
       setInterval(refresh, 5000);
+      setInterval(refreshKraken, 5000);
     </script>
   </body>
 </html>
 """
+
+
+_kraken_cache: dict[str, Any] = {"payload": None, "ts": 0.0}
+_KRAKEN_CACHE_TTL = 60.0  # seconds between Kraken API polls
+
+def _build_kraken_payload() -> dict[str, Any]:
+    if not kraken_client:
+        return {"available": False, "reason": "Kraken not configured"}
+    now = time.time()
+    if _kraken_cache["payload"] and (now - _kraken_cache["ts"]) < _KRAKEN_CACHE_TTL:
+        return _kraken_cache["payload"]
+    try:
+        balance = kraken_client._private("Balance")
+        time.sleep(1.5)
+        trade_bal = kraken_client._private("TradeBalance", {"asset": "ZUSD"})
+        time.sleep(1.5)
+        open_orders_raw = kraken_client._private("OpenOrders").get("open", {})
+        time.sleep(1.5)
+        trades_raw = kraken_client._private("TradesHistory").get("trades", {})
+    except Exception as err:
+        if _kraken_cache["payload"]:
+            return _kraken_cache["payload"]
+        return {"available": False, "reason": str(err)}
+
+    usd_balance = _to_float(balance.get("ZUSD", balance.get("USD", 0)))
+    equity = _to_float(trade_bal.get("eb", usd_balance))
+    free_margin = _to_float(trade_bal.get("mf", usd_balance))
+
+    _KRAKEN_ASSET_MAP = {
+        "XXBT": "BTC/USD", "XETH": "ETH/USD", "XLTC": "LTC/USD",
+        "XXRP": "XRP/USD", "XXDG": "DOGE/USD", "XDG": "DOGE/USD",
+        "SOL": "SOL/USD", "DOT": "DOT/USD", "LINK": "LINK/USD",
+        "AVAX": "AVAX/USD", "UNI": "UNI/USD", "AAVE": "AAVE/USD",
+        "BCH": "BCH/USD", "SHIB": "SHIB/USD", "MKR": "MKR/USD",
+        "GRT": "GRT/USD", "BAT": "BAT/USD", "CRV": "CRV/USD",
+        "SUSHI": "SUSHI/USD", "ALGO": "ALGO/USD", "BABY": "BABY/USD",
+    }
+    holdings: list[dict[str, Any]] = []
+    skip_assets = {"ZUSD", "USD", "USD.HOLD", "USDG"}
+    for asset, qty_str in balance.items():
+        qty = _to_float(qty_str)
+        if qty <= 0 or asset in skip_assets:
+            continue
+        friendly = _KRAKEN_ASSET_MAP.get(asset, asset)
+        price = None
+        try:
+            price = kraken_client.get_latest_price(friendly)
+        except Exception:
+            pass
+        holdings.append({
+            "asset": asset,
+            "symbol": friendly,
+            "qty": qty,
+            "price": price,
+            "value_usd": qty * (price or 0),
+        })
+
+    open_orders: list[dict[str, Any]] = []
+    for txid, info in open_orders_raw.items():
+        descr = info.get("descr", {})
+        open_orders.append({
+            "id": txid,
+            "pair": descr.get("pair", ""),
+            "side": descr.get("type", ""),
+            "order_type": descr.get("ordertype", ""),
+            "price": descr.get("price", "0"),
+            "volume": info.get("vol", "0"),
+            "filled": info.get("vol_exec", "0"),
+            "status": info.get("status", ""),
+            "description": descr.get("order", ""),
+        })
+
+    recent_trades: list[dict[str, Any]] = []
+    for txid, info in sorted(trades_raw.items(), key=lambda x: _to_float(x[1].get("time", 0)), reverse=True)[:30]:
+        recent_trades.append({
+            "id": txid,
+            "pair": info.get("pair", ""),
+            "side": info.get("type", ""),
+            "price": _to_float(info.get("price")),
+            "volume": _to_float(info.get("vol")),
+            "cost": _to_float(info.get("cost")),
+            "fee": _to_float(info.get("fee")),
+            "time": info.get("time"),
+        })
+
+    top_prices: dict[str, float] = {}
+    try:
+        top_syms = ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD", "LINK/USD"]
+        top_prices = kraken_client.get_crypto_latest_prices(top_syms)
+    except Exception:
+        pass
+
+    result = {
+        "available": True,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "usd_balance": usd_balance,
+        "equity": equity,
+        "free_margin": free_margin,
+        "holdings": holdings,
+        "open_orders": open_orders,
+        "recent_trades": recent_trades,
+        "live_prices": top_prices,
+    }
+    _kraken_cache["payload"] = result
+    _kraken_cache["ts"] = time.time()
+    return result
 
 
 @app.get("/")
@@ -788,6 +1060,24 @@ def api_set_reserve_target():
 def api_recirculate_reserve():
     state = reserve_store.recirculate()
     return jsonify({"ok": True, "reserve_state": state})
+
+
+@app.get("/api/kraken-dashboard")
+def api_kraken_dashboard():
+    return jsonify(_build_kraken_payload())
+
+
+@app.get("/api/fear-climate")
+def api_get_fear_climate():
+    return jsonify(load_fear_climate_state())
+
+
+@app.post("/api/fear-climate")
+def api_set_fear_climate():
+    payload = request.get_json(silent=True) or {}
+    enabled = bool(payload.get("enabled", False))
+    state = set_fear_climate_enabled(enabled)
+    return jsonify({"ok": True, "fear_climate": state})
 
 
 @app.post("/api/live-dashboard/kill-switch")

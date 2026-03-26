@@ -16,7 +16,9 @@ from revenue_generator.alpaca_client import AlpacaClient
 from revenue_generator.ai_bridge import run_ai_cycle
 from revenue_generator.bot import run_once
 from revenue_generator.config import build_runtime_config, ensure_risk_policy
+from revenue_generator.fear_climate import load_fear_climate_state
 from revenue_generator.journal import TradeJournal
+from revenue_generator.kraken_client import KrakenClient
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,8 +96,21 @@ def main() -> int:
     args = parse_args()
     cfg = build_runtime_config()
     policy = ensure_risk_policy()
-    client = AlpacaClient(cfg=cfg)
+    alpaca_client = AlpacaClient(cfg=cfg)
+    kraken_client: KrakenClient | None = None
+    crypto_broker = str(policy.get("cryptoBroker", "alpaca")).lower()
+    if crypto_broker == "kraken":
+        try:
+            kraken_client = KrakenClient()
+        except ValueError as err:
+            print(f"Kraken init failed ({err}), falling back to Alpaca for crypto.")
+            crypto_broker = "alpaca"
     journal = TradeJournal()
+
+    def _client_for_segment(segment: str) -> AlpacaClient | KrakenClient:
+        if segment == "crypto" and crypto_broker == "kraken" and kraken_client is not None:
+            return kraken_client
+        return alpaca_client
 
     profiles = policy.get("sectorCadence") or _default_profiles()
     last_run: dict[str, datetime] = {}
@@ -108,12 +123,47 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop_handler)
     signal.signal(signal.SIGTERM, _stop_handler)
 
+    def _combined_equity() -> float:
+        try:
+            alpaca_eq = float(alpaca_client.get_account().get("equity", 0))
+        except Exception:
+            alpaca_eq = 0.0
+        kraken_eq = 0.0
+        if kraken_client:
+            try:
+                kraken_eq = float(kraken_client.get_account().get("equity", 0))
+            except Exception:
+                pass
+        return alpaca_eq + kraken_eq
+
     def _run_segment(segment: str, profile: dict) -> dict:
+        client = _client_for_segment(segment)
         budget = args.budget * (float(profile.get("budgetPct", 0)) / 100.0)
+        fear_state = load_fear_climate_state()
+        if segment == "crypto" and bool(fear_state.get("enabled", False)):
+            result = {
+                "strategy": "rule_engine",
+                "account_status": "ACTIVE",
+                "segment": segment,
+                "budget": budget,
+                "execute": args.execute,
+                "reason": "Fear climate mode ON: scheduler paused for new crypto entries.",
+                "orders_planned": [],
+                "orders_placed": [],
+                "order_errors": [],
+                "fear_climate": fear_state,
+                "broker": "kraken" if (crypto_broker == "kraken" and kraken_client is not None) else "alpaca",
+            }
+            journal.log_cycle(result)
+            print(json.dumps({"segment": segment, "at": datetime.now(timezone.utc).isoformat(), "result": result}, indent=2))
+            return result
         ai_cfg = policy.get("aiScheduler", {})
         ai_enabled = bool(ai_cfg.get("enabled", False))
         ai_segments = ai_cfg.get("segments", ["pennyStocks", "crypto", "indexFunds"])
         use_ai = ai_enabled and segment in ai_segments
+        advisory_only_segments = {str(s) for s in (ai_cfg.get("advisoryOnlySegments", []) or [])}
+        advisory_only = segment in advisory_only_segments
+        total_equity = _combined_equity() if kraken_client else None
         try:
             if use_ai:
                 ai_error = None
@@ -124,6 +174,7 @@ def main() -> int:
                         segment=segment,
                         budget=budget,
                         execute=args.execute,
+                        combined_equity=total_equity,
                     )
                 except Exception as err:
                     ai_error = str(err)
@@ -138,12 +189,29 @@ def main() -> int:
                         "orders_placed": [],
                         "order_errors": [],
                     }
-                # Only fallback when AI actually ran and vetoed/failed.
-                if (
-                    bool(result.get("ai_used", False))
-                    and not result.get("ai_allowed", False)
-                    and bool(ai_cfg.get("fallbackToRuleEngine", True))
-                ):
+                ai_used = bool(result.get("ai_used", False))
+                ai_skipped = not ai_used and result.get("ai_skipped_reason")
+                ai_vetoed = ai_used and not result.get("ai_allowed", False)
+                should_fallback = (ai_skipped or ai_vetoed) and bool(ai_cfg.get("fallbackToRuleEngine", True))
+                if advisory_only:
+                    fallback = run_once(
+                        client=client,
+                        risk_policy=policy,
+                        segment=segment,
+                        budget=budget,
+                        execute=args.execute,
+                    )
+                    fallback["ai_advisory_only"] = True
+                    fallback["ai_summary"] = {
+                        "ai_used": ai_used,
+                        "ai_allowed": result.get("ai_allowed"),
+                        "ai_reason": result.get("ai_reason") or result.get("ai_skipped_reason"),
+                        "ai_signal": result.get("ai_signal"),
+                    }
+                    if ai_error:
+                        fallback["ai_error"] = ai_error
+                    result = fallback
+                elif should_fallback:
                     fallback = run_once(
                         client=client,
                         risk_policy=policy,
@@ -154,7 +222,7 @@ def main() -> int:
                     fallback["ai_fallback_used"] = True
                     fallback["ai_summary"] = {
                         "ai_allowed": result.get("ai_allowed"),
-                        "ai_reason": result.get("ai_reason"),
+                        "ai_reason": result.get("ai_reason") or result.get("ai_skipped_reason"),
                         "ai_signal": result.get("ai_signal"),
                     }
                     if ai_error:
@@ -168,6 +236,7 @@ def main() -> int:
                     budget=budget,
                     execute=args.execute,
                 )
+            result["broker"] = "kraken" if (segment == "crypto" and crypto_broker == "kraken") else "alpaca"
         except Exception as err:
             result = {
                 "segment": segment,

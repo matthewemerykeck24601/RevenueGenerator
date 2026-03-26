@@ -14,6 +14,7 @@ from revenue_generator.alpaca_client import AlpacaClient
 from revenue_generator.config import build_runtime_config, ensure_risk_policy
 from revenue_generator.exit_manager import ExitManager
 from revenue_generator.journal import TradeJournal
+from revenue_generator.kraken_client import KrakenClient
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,9 +29,22 @@ def main() -> int:
     args = parse_args()
     cfg = build_runtime_config()
     policy = ensure_risk_policy()
-    client = AlpacaClient(cfg=cfg)
+    alpaca_client = AlpacaClient(cfg=cfg)
+    kraken_client: KrakenClient | None = None
+    crypto_broker = str(policy.get("cryptoBroker", "alpaca")).lower()
+    if crypto_broker == "kraken":
+        try:
+            kraken_client = KrakenClient()
+        except ValueError as err:
+            print(f"Kraken init failed ({err}), falling back to Alpaca for crypto exits.")
+            crypto_broker = "alpaca"
     journal = TradeJournal()
-    manager = ExitManager(client=client, risk_policy=policy, journal=journal)
+    manager = ExitManager(
+        client=alpaca_client,
+        risk_policy=policy,
+        journal=journal,
+        crypto_client=kraken_client if crypto_broker == "kraken" else None,
+    )
 
     stop_flag = {"stop": False}
 
