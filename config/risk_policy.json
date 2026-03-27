@@ -34,10 +34,10 @@
       "minExpectedEdgeNet": 0.002,
       "allowAddOnBuys": true,
       "sectorBudgetPct": {
-        "largeCapStocks": 45,
-        "indexFunds": 35,
-        "crypto": 15,
-        "pennyStocks": 5
+        "largeCapStocks": 60,
+        "indexFunds": 15,
+        "crypto": 25,
+        "pennyStocks": 0
       }
     },
     "aggressive": {
@@ -57,9 +57,9 @@
         "trailingStopPct": 1.3
       },
       "sectorBudgetPct": {
-        "largeCapStocks": 50,
-        "indexFunds": 30,
-        "crypto": 20,
+        "largeCapStocks": 60,
+        "indexFunds": 15,
+        "crypto": 25,
         "pennyStocks": 0
       }
     }
@@ -196,12 +196,12 @@
     "indexFunds": {
       "enabled": true,
       "intervalSeconds": 180,
-      "budgetPct": 35
+      "budgetPct": 15
     },
     "largeCapStocks": {
       "enabled": true,
       "intervalSeconds": 240,
-      "budgetPct": 45
+      "budgetPct": 60
     },
     "crypto": {
       "enabled": true,
@@ -211,7 +211,7 @@
     "pennyStocks": {
       "enabled": false,
       "intervalSeconds": 120,
-      "budgetPct": 5
+      "budgetPct": 0
     }
   },
   "takeProfitPct": 4.5,

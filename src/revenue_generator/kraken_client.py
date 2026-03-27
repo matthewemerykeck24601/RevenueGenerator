@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import os
 import time
 import urllib.parse
@@ -169,7 +170,9 @@ class KrakenClient:
 
     def _format_volume(self, kraken_pair: str, volume: float) -> str:
         decimals = self._lot_decimals.get(kraken_pair, 8)
-        return f"{volume:.{decimals}f}".rstrip("0").rstrip(".")
+        scale = 10 ** max(decimals, 0)
+        floored = math.floor(max(volume, 0.0) * scale) / scale
+        return f"{floored:.{decimals}f}".rstrip("0").rstrip(".")
 
     def _sign(self, url_path: str, data: dict[str, Any]) -> str:
         encoded = (str(data["nonce"]) + urllib.parse.urlencode(data)).encode()

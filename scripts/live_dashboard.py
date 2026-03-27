@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import time
@@ -33,6 +34,16 @@ if str(risk_policy.get("cryptoBroker", "")).lower() == "kraken":
     except Exception:
         pass
 RESERVE_STATE_PATH = ROOT / "logs" / "reserve_state.json"
+EXIT_MANAGER_HEARTBEAT_PATH = ROOT / "logs" / "exit_manager_heartbeat.json"
+EXIT_MANAGER_STALE_SECONDS = 130
+SCHEDULER_HEARTBEAT_PATH = ROOT / "logs" / "scheduler_heartbeat.json"
+SCHEDULER_STALE_SECONDS = 150
+TRADES_DB_PATH = ROOT / "logs" / "trades.db"
+SEGMENT_OVERRIDES_PATH = ROOT / "config" / "segment_symbol_overrides.json"
+_SEGMENT_HINT_CACHE: dict[str, Any] = {"ts": 0.0, "hints": {}}
+_SEGMENT_HINT_TTL_SECONDS = 20.0
+_SEGMENT_OVERRIDE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": {}}
+_SEGMENT_OVERRIDE_TTL_SECONDS = 60.0
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -40,6 +51,15 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class ReserveStateStore:
@@ -78,7 +98,10 @@ class ReserveStateStore:
 
     def set_target(self, target_amount: float) -> dict[str, Any]:
         self._refresh()
-        self._state["reserve_target_request"] = max(target_amount, 0.0)
+        # Treat incoming target as an additional reserve request (incremental),
+        # not an absolute reserve total.
+        current_pending = max(_to_float(self._state.get("reserve_target_request")), 0.0)
+        self._state["reserve_target_request"] = current_pending + max(target_amount, 0.0)
         self._save()
         return dict(self._state)
 
@@ -102,15 +125,13 @@ class ReserveStateStore:
             reserve_balance = bounded_balance
             changed = True
 
-        # Fill reserve request only from currently unreserved cash.
-        if reserve_target_request > reserve_balance:
+        # Fill pending reserve request only from currently unreserved cash.
+        if reserve_target_request > 0:
             free_cash = max(cash - reserve_balance, 0.0)
-            fill = min(reserve_target_request - reserve_balance, free_cash)
+            fill = min(reserve_target_request, free_cash)
             if fill > 0:
                 reserve_balance += fill
-                changed = True
-            if reserve_balance >= reserve_target_request:
-                reserve_target_request = 0.0
+                reserve_target_request -= fill
                 changed = True
 
         self._state["reserve_balance"] = round(reserve_balance, 6)
@@ -161,6 +182,457 @@ $result | ConvertTo-Json -Compress
         return {"ok": True, "count": int(data.get("count", len(killed))), "killed": killed}
     except Exception as err:
         return {"ok": False, "count": 0, "killed": [], "error": str(err)}
+
+
+def _load_exit_manager_health() -> dict[str, Any]:
+    if not EXIT_MANAGER_HEARTBEAT_PATH.exists():
+        return {
+            "available": False,
+            "status": "missing",
+            "healthy": False,
+            "stale": True,
+            "reason": "Heartbeat file not found.",
+        }
+    try:
+        raw = json.loads(EXIT_MANAGER_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except Exception as err:
+        return {
+            "available": False,
+            "status": "unreadable",
+            "healthy": False,
+            "stale": True,
+            "reason": f"Heartbeat read failed: {err}",
+        }
+
+    updated_at = _parse_iso(raw.get("updated_at"))
+    age_seconds: int | None = None
+    if updated_at is not None:
+        age_seconds = max(int((datetime.now(timezone.utc) - updated_at).total_seconds()), 0)
+    stale = age_seconds is None or age_seconds > EXIT_MANAGER_STALE_SECONDS
+    status = str(raw.get("status") or "unknown")
+    consecutive_errors = int(raw.get("consecutive_errors") or 0)
+    healthy = (status in {"ok", "started", "recovered"}) and not stale and consecutive_errors == 0
+    if stale and status == "ok":
+        status = "stale"
+    return {
+        "available": True,
+        "healthy": healthy,
+        "stale": stale,
+        "status": status,
+        "updated_at": raw.get("updated_at"),
+        "age_seconds": age_seconds,
+        "pid": raw.get("pid"),
+        "execute": bool(raw.get("execute", False)),
+        "cycle_count": int(raw.get("cycle_count") or 0),
+        "consecutive_errors": consecutive_errors,
+        "suppressed": raw.get("suppressed") if isinstance(raw.get("suppressed"), dict) else {},
+        "error": str(raw.get("error") or ""),
+    }
+
+
+def _load_scheduler_health() -> dict[str, Any]:
+    if not SCHEDULER_HEARTBEAT_PATH.exists():
+        return {
+            "available": False,
+            "status": "missing",
+            "healthy": False,
+            "stale": True,
+            "reason": "Scheduler heartbeat file not found.",
+        }
+    try:
+        raw = json.loads(SCHEDULER_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except Exception as err:
+        return {
+            "available": False,
+            "status": "unreadable",
+            "healthy": False,
+            "stale": True,
+            "reason": f"Scheduler heartbeat read failed: {err}",
+        }
+    updated_at = _parse_iso(raw.get("updated_at"))
+    age_seconds: int | None = None
+    if updated_at is not None:
+        age_seconds = max(int((datetime.now(timezone.utc) - updated_at).total_seconds()), 0)
+    stale_after_seconds = int(raw.get("stale_after_seconds") or SCHEDULER_STALE_SECONDS)
+    stale = age_seconds is None or age_seconds > stale_after_seconds
+    status = str(raw.get("status") or "unknown")
+    consecutive_errors = int(raw.get("consecutive_errors") or 0)
+    healthy = (status in {"ok", "started", "recovered"}) and not stale and consecutive_errors == 0
+    if stale and status == "ok":
+        status = "stale"
+    return {
+        "available": True,
+        "healthy": healthy,
+        "stale": stale,
+        "status": status,
+        "updated_at": raw.get("updated_at"),
+        "age_seconds": age_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "pid": raw.get("pid"),
+        "execute": bool(raw.get("execute", False)),
+        "cycle_count": int(raw.get("cycle_count") or 0),
+        "consecutive_errors": consecutive_errors,
+        "schedule_mode": str(raw.get("schedule_mode") or ""),
+        "ran_segments": raw.get("ran_segments") if isinstance(raw.get("ran_segments"), list) else [],
+        "active_segments": raw.get("active_segments") if isinstance(raw.get("active_segments"), list) else [],
+        "error": str(raw.get("error") or ""),
+    }
+
+
+def _load_symbol_segment_hints() -> dict[str, str]:
+    now = time.time()
+    cached_ts = float(_SEGMENT_HINT_CACHE.get("ts", 0.0) or 0.0)
+    cached_hints = _SEGMENT_HINT_CACHE.get("hints")
+    if isinstance(cached_hints, dict) and (now - cached_ts) < _SEGMENT_HINT_TTL_SECONDS:
+        return dict(cached_hints)
+    if not TRADES_DB_PATH.exists():
+        _SEGMENT_HINT_CACHE["ts"] = now
+        _SEGMENT_HINT_CACHE["hints"] = {}
+        return {}
+
+    hints: dict[str, str] = {}
+    try:
+        con = sqlite3.connect(TRADES_DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT ts, segment, orders_planned_json, orders_placed_json
+            FROM cycles
+            ORDER BY ts DESC
+            LIMIT 1200
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            con.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    for row in rows:
+        segment = str(row["segment"] or "").strip()
+        if not segment:
+            continue
+        for field in ("orders_placed_json", "orders_planned_json"):
+            raw = row[field]
+            try:
+                orders = json.loads(raw or "[]")
+            except Exception:
+                orders = []
+            if not isinstance(orders, list):
+                continue
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                symbol = str(order.get("symbol") or "").strip()
+                if not symbol:
+                    continue
+                # DESC query order means first write wins (most recent segment)
+                if symbol not in hints:
+                    hints[symbol] = segment
+
+    _SEGMENT_HINT_CACHE["ts"] = now
+    _SEGMENT_HINT_CACHE["hints"] = dict(hints)
+    return hints
+
+
+def _load_segment_overrides() -> dict[str, str]:
+    now = time.time()
+    cached_ts = float(_SEGMENT_OVERRIDE_CACHE.get("ts", 0.0) or 0.0)
+    cached_symbols = _SEGMENT_OVERRIDE_CACHE.get("symbols")
+    if isinstance(cached_symbols, dict) and (now - cached_ts) < _SEGMENT_OVERRIDE_TTL_SECONDS:
+        return dict(cached_symbols)
+    if not SEGMENT_OVERRIDES_PATH.exists():
+        _SEGMENT_OVERRIDE_CACHE["ts"] = now
+        _SEGMENT_OVERRIDE_CACHE["symbols"] = {}
+        return {}
+    try:
+        raw = json.loads(SEGMENT_OVERRIDES_PATH.read_text(encoding="utf-8"))
+        symbols = raw.get("symbols", {}) if isinstance(raw, dict) else {}
+        if not isinstance(symbols, dict):
+            symbols = {}
+    except Exception:
+        symbols = {}
+    normalized = {
+        str(sym).strip(): str(seg).strip()
+        for sym, seg in symbols.items()
+        if str(sym).strip() and str(seg).strip() in {"indexFunds", "largeCapStocks", "crypto", "pennyStocks"}
+    }
+    _SEGMENT_OVERRIDE_CACHE["ts"] = now
+    _SEGMENT_OVERRIDE_CACHE["symbols"] = dict(normalized)
+    return normalized
+
+
+def _save_segment_overrides(symbols: dict[str, str]) -> None:
+    SEGMENT_OVERRIDES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "symbols": dict(sorted(symbols.items())),
+    }
+    SEGMENT_OVERRIDES_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _SEGMENT_OVERRIDE_CACHE["ts"] = time.time()
+    _SEGMENT_OVERRIDE_CACHE["symbols"] = dict(symbols)
+
+
+def _auto_promote_segment_overrides(
+    *,
+    index_symbols: set[str],
+    large_cap_symbols: set[str],
+    crypto_symbols: set[str],
+    segment_hints: dict[str, str],
+) -> dict[str, str]:
+    overrides = _load_segment_overrides()
+    if not TRADES_DB_PATH.exists():
+        return overrides
+    try:
+        con = sqlite3.connect(TRADES_DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT symbol, price, result_json
+            FROM exit_actions
+            WHERE execute = 1
+            ORDER BY ts DESC
+            LIMIT 3000
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            con.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    md_cfg = risk_policy.get("marketDiscovery", {}) if isinstance(risk_policy.get("marketDiscovery", {}), dict) else {}
+    penny_cap = float(md_cfg.get("minPriceUsd", 10.0) or 10.0)
+    pending: dict[str, list[float]] = {}
+    for row in rows:
+        symbol = str(row["symbol"] or "").strip()
+        if not symbol or symbol in overrides:
+            continue
+        sym_u = symbol.upper()
+        if symbol in crypto_symbols or "/" in symbol or (sym_u.endswith("USD") and len(sym_u) >= 6):
+            continue
+        # Ignore known failed attempts.
+        result_raw = str(row["result_json"] or "").strip()
+        if result_raw:
+            try:
+                result = json.loads(result_raw)
+            except Exception:
+                result = {}
+            if isinstance(result, dict) and (result.get("ok") is False or (result.get("error") and result.get("ok") is not True)):
+                continue
+        try:
+            px = float(row["price"] or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        bucket = pending.setdefault(symbol, [])
+        if px > 0:
+            bucket.append(px)
+
+    changed = False
+    for symbol, prices in pending.items():
+        hinted = str(segment_hints.get(symbol) or "").strip()
+        if hinted in {"indexFunds", "largeCapStocks", "pennyStocks"}:
+            target = hinted
+        elif symbol in index_symbols:
+            target = "indexFunds"
+        elif symbol in large_cap_symbols:
+            target = "largeCapStocks"
+        else:
+            avg_px = (sum(prices) / len(prices)) if prices else 0.0
+            target = "pennyStocks" if (avg_px > 0 and avg_px <= penny_cap) else "largeCapStocks"
+        if overrides.get(symbol) != target:
+            overrides[symbol] = target
+            changed = True
+
+    if changed:
+        _save_segment_overrides(overrides)
+    return overrides
+
+
+def _segment_for_symbol(
+    symbol: str,
+    *,
+    index_symbols: set[str],
+    large_cap_symbols: set[str],
+    crypto_symbols: set[str],
+    segment_hints: dict[str, str],
+    segment_overrides: dict[str, str],
+) -> str:
+    sym = str(symbol or "").strip()
+    sym_u = sym.upper()
+    if sym in crypto_symbols or "/" in sym or (sym_u.endswith("USD") and len(sym_u) >= 6):
+        return "crypto"
+    override = str(segment_overrides.get(sym) or "").strip()
+    if override in {"indexFunds", "largeCapStocks", "crypto", "pennyStocks"}:
+        return override
+    hinted = str(segment_hints.get(sym) or "").strip()
+    if hinted in {"indexFunds", "largeCapStocks", "crypto", "pennyStocks"}:
+        return hinted
+    if sym in index_symbols:
+        return "indexFunds"
+    if sym in large_cap_symbols:
+        return "largeCapStocks"
+    return "other"
+
+
+def _compute_overall_sell_stats(
+    *,
+    index_symbols: set[str],
+    large_cap_symbols: set[str],
+    crypto_symbols: set[str],
+    segment_hints: dict[str, str],
+    segment_overrides: dict[str, str],
+    roundtrip_cost_pct_stocks: float,
+    roundtrip_cost_pct_crypto: float,
+) -> dict[str, Any]:
+    empty_segments = {
+        "indexFunds": {"evaluated": 0, "wins": 0, "win_rate_pct": 0.0},
+        "largeCapStocks": {"evaluated": 0, "wins": 0, "win_rate_pct": 0.0},
+        "crypto": {"evaluated": 0, "wins": 0, "win_rate_pct": 0.0},
+        "pennyStocks": {"evaluated": 0, "wins": 0, "win_rate_pct": 0.0},
+        "other": {"evaluated": 0, "wins": 0, "win_rate_pct": 0.0},
+    }
+    if not TRADES_DB_PATH.exists():
+        return {
+            "evaluated": 0,
+            "wins": 0,
+            "win_rate_pct": 0.0,
+            "net_wins": 0,
+            "net_win_rate_pct": 0.0,
+            "avg_win_pct": 0.0,
+            "avg_loss_pct": 0.0,
+            "payoff_ratio": 0.0,
+            "profit_factor": 0.0,
+            "by_segment": empty_segments,
+        }
+
+    try:
+        con = sqlite3.connect(TRADES_DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT symbol, pnl_pct, qty, price, result_json
+            FROM exit_actions
+            WHERE execute = 1
+            ORDER BY ts ASC
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            con.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    sell_trades_evaluated = 0
+    sell_wins = 0
+    net_sell_wins = 0
+    realized_win_pcts: list[float] = []
+    realized_loss_pcts: list[float] = []
+    gross_profit_usd = 0.0
+    gross_loss_usd = 0.0
+    segment_counts: dict[str, dict[str, int]] = {
+        "indexFunds": {"evaluated": 0, "wins": 0},
+        "largeCapStocks": {"evaluated": 0, "wins": 0},
+        "crypto": {"evaluated": 0, "wins": 0},
+        "pennyStocks": {"evaluated": 0, "wins": 0},
+        "other": {"evaluated": 0, "wins": 0},
+    }
+
+    for row in rows:
+        symbol = str(row["symbol"] or "")
+        try:
+            pnl_pct = float(row["pnl_pct"] or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+        # Ignore known failed order attempts from reliability retries.
+        result_raw = str(row["result_json"] or "").strip()
+        if result_raw:
+            try:
+                result = json.loads(result_raw)
+            except Exception:
+                result = {}
+            if isinstance(result, dict):
+                if result.get("ok") is False:
+                    continue
+                if result.get("error") and result.get("ok") is not True:
+                    continue
+
+        seg = _segment_for_symbol(
+            symbol,
+            index_symbols=index_symbols,
+            large_cap_symbols=large_cap_symbols,
+            crypto_symbols=crypto_symbols,
+            segment_hints=segment_hints,
+            segment_overrides=segment_overrides,
+        )
+        if seg not in segment_counts:
+            seg = "other"
+
+        sell_trades_evaluated += 1
+        segment_counts[seg]["evaluated"] += 1
+
+        if pnl_pct > 0:
+            sell_wins += 1
+            segment_counts[seg]["wins"] += 1
+            realized_win_pcts.append(pnl_pct)
+        elif pnl_pct < 0:
+            realized_loss_pcts.append(abs(pnl_pct))
+
+        cost_pct = roundtrip_cost_pct_crypto if seg == "crypto" else roundtrip_cost_pct_stocks
+        net_realized_pl_pct = pnl_pct - (cost_pct * 100.0)
+        if net_realized_pl_pct > 0:
+            net_sell_wins += 1
+
+        # Proxy USD P/L from current notional and pnl_pct.
+        try:
+            qty = float(row["qty"] or 0.0)
+            price = float(row["price"] or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+            price = 0.0
+        notional = max(qty * price, 0.0)
+        pnl_usd = notional * (pnl_pct / 100.0)
+        if pnl_usd > 0:
+            gross_profit_usd += pnl_usd
+        elif pnl_usd < 0:
+            gross_loss_usd += abs(pnl_usd)
+
+    sell_win_rate_pct = (sell_wins / sell_trades_evaluated * 100.0) if sell_trades_evaluated > 0 else 0.0
+    net_sell_win_rate_pct = (net_sell_wins / sell_trades_evaluated * 100.0) if sell_trades_evaluated > 0 else 0.0
+    avg_win_pct = (sum(realized_win_pcts) / len(realized_win_pcts)) if realized_win_pcts else 0.0
+    avg_loss_pct = (sum(realized_loss_pcts) / len(realized_loss_pcts)) if realized_loss_pcts else 0.0
+    payoff_ratio = (avg_win_pct / avg_loss_pct) if avg_loss_pct > 0 else 0.0
+    profit_factor = (gross_profit_usd / gross_loss_usd) if gross_loss_usd > 0 else 0.0
+
+    by_segment: dict[str, dict[str, float]] = {}
+    for seg_name, counts in segment_counts.items():
+        evaluated = int(counts["evaluated"])
+        wins = int(counts["wins"])
+        by_segment[seg_name] = {
+            "evaluated": evaluated,
+            "wins": wins,
+            "win_rate_pct": (wins / evaluated * 100.0) if evaluated > 0 else 0.0,
+        }
+
+    return {
+        "evaluated": sell_trades_evaluated,
+        "wins": sell_wins,
+        "win_rate_pct": sell_win_rate_pct,
+        "net_wins": net_sell_wins,
+        "net_win_rate_pct": net_sell_win_rate_pct,
+        "avg_win_pct": avg_win_pct,
+        "avg_loss_pct": avg_loss_pct,
+        "payoff_ratio": payoff_ratio,
+        "profit_factor": profit_factor,
+        "by_segment": by_segment,
+    }
 
 
 def _build_dashboard_payload() -> dict[str, Any]:
@@ -246,21 +718,20 @@ def _build_dashboard_payload() -> dict[str, Any]:
     index_symbols = set(segment_allow.get("indexFunds", {}).get("symbolsAllowlist", []))
     large_cap_symbols = set(segment_allow.get("largeCapStocks", {}).get("symbolsAllowlist", []))
     crypto_symbols = set(segment_allow.get("crypto", {}).get("symbolsAllowlist", []))
+    segment_hints = _load_symbol_segment_hints()
+    segment_overrides = _auto_promote_segment_overrides(
+        index_symbols=index_symbols,
+        large_cap_symbols=large_cap_symbols,
+        crypto_symbols=crypto_symbols,
+        segment_hints=segment_hints,
+    )
     segment_stats: dict[str, dict[str, float]] = {
         "indexFunds": {"evaluated": 0.0, "wins": 0.0},
         "largeCapStocks": {"evaluated": 0.0, "wins": 0.0},
         "crypto": {"evaluated": 0.0, "wins": 0.0},
         "pennyStocks": {"evaluated": 0.0, "wins": 0.0},
+        "other": {"evaluated": 0.0, "wins": 0.0},
     }
-
-    def _segment_for_symbol(symbol: str) -> str:
-        if symbol in crypto_symbols or "/" in symbol:
-            return "crypto"
-        if symbol in index_symbols:
-            return "indexFunds"
-        if symbol in large_cap_symbols:
-            return "largeCapStocks"
-        return "pennyStocks"
 
     for fill in sorted(filled_orders, key=lambda r: r["filled_at"]):
         symbol = str(fill.get("symbol") or "")
@@ -310,7 +781,14 @@ def _build_dashboard_payload() -> dict[str, Any]:
         elif realized_pl_usd < 0:
             gross_loss_usd += abs(realized_pl_usd)
 
-        seg = _segment_for_symbol(symbol)
+        seg = _segment_for_symbol(
+            symbol,
+            index_symbols=index_symbols,
+            large_cap_symbols=large_cap_symbols,
+            crypto_symbols=crypto_symbols,
+            segment_hints=segment_hints,
+            segment_overrides=segment_overrides,
+        )
         seg_bucket = segment_stats.setdefault(seg, {"evaluated": 0.0, "wins": 0.0})
         seg_bucket["evaluated"] += 1.0
         if realized_pl_pct > 0:
@@ -337,6 +815,17 @@ def _build_dashboard_payload() -> dict[str, Any]:
             "wins": wins,
             "win_rate_pct": (wins / evaluated * 100.0) if evaluated > 0 else 0.0,
         }
+
+    overall_stats = _compute_overall_sell_stats(
+        index_symbols=index_symbols,
+        large_cap_symbols=large_cap_symbols,
+        crypto_symbols=crypto_symbols,
+        segment_hints=segment_hints,
+        segment_overrides=segment_overrides,
+        roundtrip_cost_pct_stocks=roundtrip_cost_pct_stocks,
+        roundtrip_cost_pct_crypto=roundtrip_cost_pct_crypto,
+    )
+    use_overall = int(overall_stats.get("evaluated", 0)) > 0
 
     recent_fills = list(filled_orders)
     recent_fills.sort(key=lambda r: r["filled_at"], reverse=True)
@@ -379,22 +868,23 @@ def _build_dashboard_payload() -> dict[str, Any]:
             "max_open_positions": max_open_positions,
             "open_positions_market_value": total_market_value,
             "open_positions_unrealized_pl": total_unrealized_pl,
-            "sell_trades_evaluated": sell_trades_evaluated,
-            "sell_wins": sell_wins,
-            "sell_win_rate_pct": sell_win_rate_pct,
-            "net_sell_wins": net_sell_wins,
-            "net_sell_win_rate_pct": net_sell_win_rate_pct,
-            "avg_win_pct": avg_win_pct,
-            "avg_loss_pct": avg_loss_pct,
-            "payoff_ratio": payoff_ratio,
-            "profit_factor": profit_factor,
+            "sell_trades_evaluated": int(overall_stats["evaluated"]) if use_overall else sell_trades_evaluated,
+            "sell_wins": int(overall_stats["wins"]) if use_overall else sell_wins,
+            "sell_win_rate_pct": float(overall_stats["win_rate_pct"]) if use_overall else sell_win_rate_pct,
+            "net_sell_wins": int(overall_stats["net_wins"]) if use_overall else net_sell_wins,
+            "net_sell_win_rate_pct": float(overall_stats["net_win_rate_pct"]) if use_overall else net_sell_win_rate_pct,
+            "avg_win_pct": float(overall_stats["avg_win_pct"]) if use_overall else avg_win_pct,
+            "avg_loss_pct": float(overall_stats["avg_loss_pct"]) if use_overall else avg_loss_pct,
+            "payoff_ratio": float(overall_stats["payoff_ratio"]) if use_overall else payoff_ratio,
+            "profit_factor": float(overall_stats["profit_factor"]) if use_overall else profit_factor,
             "roundtrip_cost_bps_stocks": roundtrip_cost_pct_stocks * 10000.0,
             "roundtrip_cost_bps_crypto": roundtrip_cost_pct_crypto * 10000.0,
-            "sell_win_rate_by_segment": sell_win_rate_by_segment,
+            "sell_win_rate_by_segment": overall_stats["by_segment"] if use_overall else sell_win_rate_by_segment,
             "reserve_balance": reserve_balance,
             "reserve_target_request": reserve_target_request,
             "deployable_cash": deployable_cash,
             "fear_climate_enabled": bool(fear_state.get("enabled", False)),
+            "win_rate_basis": "overall_exit_history" if use_overall else "recent_broker_fills",
         },
         "open_positions": open_positions,
         "recent_fills": recent_fills,
@@ -439,6 +929,17 @@ LIVE_HTML = """
       }
       .killSwitchBtn:hover { filter: brightness(1.12); }
       .killStatus { color: var(--muted); font-size: 12px; margin-top: 4px; min-height: 16px; }
+      .healthAlert {
+        display: none;
+        margin: 10px 0 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid #7a2635;
+        background: linear-gradient(180deg, #3a121d, #2a0d15);
+        color: #ffdbe2;
+        font-size: 13px;
+        font-weight: 700;
+      }
       .dotSkull { width: 28px; height: 28px; }
       .dotSkull circle { fill: #ffdbe2; }
       .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 12px; }
@@ -540,18 +1041,30 @@ LIVE_HTML = """
         </div>
       </div>
     </div>
+    <div id="exitMgrAlert" class="healthAlert">Exit manager health alert.</div>
+    <div id="schedulerAlert" class="healthAlert">Scheduler health alert.</div>
 
     <div class="cards">
       <div class="card"><div class="k">Budget (Deployable Equity)</div><div class="v" id="budget">$0</div></div>
       <div class="card"><div class="k">Balance (Equity)</div><div class="v" id="equity">$0</div></div>
       <div class="card"><div class="k">Open Positions</div><div class="v" id="openCountTop">0</div></div>
-      <div class="card"><div class="k">Sell Win Rate</div><div class="v" id="sellWinRateTop">0.00%</div></div>
-      <div class="card"><div class="k">Net Sell Win Rate</div><div class="v" id="netSellWinRateTop">0.00%</div></div>
+      <div class="card"><div class="k">Sell Win Rate (Overall)</div><div class="v" id="sellWinRateTop">0.00%</div></div>
+      <div class="card"><div class="k">Net Sell Win Rate (Overall)</div><div class="v" id="netSellWinRateTop">0.00%</div></div>
       <div class="card"><div class="k">Payoff Ratio</div><div class="v" id="payoffRatioTop">0.00x</div></div>
       <div class="card"><div class="k">Profit Factor</div><div class="v" id="profitFactorTop">0.00x</div></div>
       <div class="card"><div class="k">Reserve Pot</div><div class="v" id="reserveTop">$0</div></div>
       <div class="card"><div class="k">Cash</div><div class="v" id="cash">$0</div></div>
       <div class="card"><div class="k">Deployable Cash</div><div class="v" id="deployableCash">$0</div></div>
+      <div class="card">
+        <div class="k">Exit Manager Health</div>
+        <div class="v" id="exitMgrHealthTop">--</div>
+        <div id="exitMgrHealthMeta" style="margin-top:6px; color:var(--muted); font-size:11px;">Heartbeat: --</div>
+      </div>
+      <div class="card">
+        <div class="k">Scheduler Health</div>
+        <div class="v" id="schedulerHealthTop">--</div>
+        <div id="schedulerHealthMeta" style="margin-top:6px; color:var(--muted); font-size:11px;">Heartbeat: --</div>
+      </div>
       <div class="card"><div class="k">Purchases (Open MV)</div><div class="v" id="openMv">$0</div></div>
       <div class="card"><div class="k">Returns (Unrealized)</div><div class="v" id="unrealized">$0</div></div>
       <div class="card"><div class="k">Up / Down Today</div><div class="v" id="dayPnl">$0</div></div>
@@ -756,10 +1269,18 @@ LIVE_HTML = """
         const segTableBody = document.querySelector("#segmentWinTable tbody");
         segTableBody.innerHTML = "";
         const segMap = s.sell_win_rate_by_segment || {};
-        for (const seg of ["largeCapStocks", "indexFunds", "crypto", "pennyStocks"]) {
+        const segmentRows = [
+          { key: "crypto", label: "crypto" },
+          { key: "largeCapStocks", label: "largeCapStocks" },
+          { key: "indexFunds", label: "indexFunds" },
+          { key: "pennyStocks", label: "pennyStocks" },
+          { key: "other", label: "other" },
+        ];
+        for (const segInfo of segmentRows) {
+          const seg = segInfo.key;
           const row = segMap[seg] || { wins: 0, evaluated: 0, win_rate_pct: 0 };
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td>${seg}</td><td>${row.wins || 0}</td><td>${row.evaluated || 0}</td><td>${fmtPct(row.win_rate_pct || 0)}</td>`;
+          tr.innerHTML = `<td>${segInfo.label}</td><td>${row.wins || 0}</td><td>${row.evaluated || 0}</td><td>${fmtPct(row.win_rate_pct || 0)}</td>`;
           segTableBody.appendChild(tr);
         }
       }
@@ -823,6 +1344,126 @@ LIVE_HTML = """
         }
       }
 
+      function renderExitManagerHealth(h) {
+        const top = document.getElementById("exitMgrHealthTop");
+        const meta = document.getElementById("exitMgrHealthMeta");
+        top.classList.remove("good", "bad");
+        if (!h || !h.available) {
+          top.textContent = "UNAVAILABLE";
+          top.classList.add("bad");
+          meta.textContent = `Heartbeat: ${h && h.reason ? h.reason : "not available"}`;
+          return;
+        }
+
+        const status = String(h.status || "unknown").toUpperCase();
+        const age = Number(h.age_seconds ?? -1);
+        if (h.healthy) {
+          top.textContent = "HEALTHY";
+          top.classList.add("good");
+        } else {
+          top.textContent = status;
+          top.classList.add("bad");
+        }
+
+        const updatedAt = h.updated_at ? `${fmtEtTime(h.updated_at)} ET` : "--";
+        const pid = h.pid != null ? String(h.pid) : "--";
+        const cycle = Number(h.cycle_count || 0);
+        const errors = Number(h.consecutive_errors || 0);
+        const ageText = age >= 0 ? `${age}s` : "--";
+        meta.textContent = `Heartbeat: ${updatedAt} | Age: ${ageText} | PID: ${pid} | Cycle: ${cycle} | Errors: ${errors}`;
+      }
+
+      function renderExitManagerAlert(h) {
+        const alert = document.getElementById("exitMgrAlert");
+        if (!h || !h.available) {
+          alert.style.display = "block";
+          alert.textContent = "Exit manager alert: heartbeat unavailable.";
+          return;
+        }
+        if (h.healthy) {
+          alert.style.display = "none";
+          return;
+        }
+        const status = String(h.status || "unknown").toUpperCase();
+        const age = Number(h.age_seconds ?? -1);
+        const ageText = age >= 0 ? `${age}s` : "--";
+        const detail = h.error ? ` | Error: ${h.error}` : "";
+        alert.style.display = "block";
+        alert.textContent = `Exit manager alert: ${status} | Heartbeat age: ${ageText}${detail}`;
+      }
+
+      async function refreshExitManagerHealth() {
+        try {
+          const resp = await fetch("/api/live-dashboard/exit-manager-health");
+          const health = await resp.json();
+          renderExitManagerHealth(health);
+          renderExitManagerAlert(health);
+        } catch (err) {
+          const fallback = { available: false, reason: err && err.message ? err.message : "fetch failed" };
+          renderExitManagerHealth(fallback);
+          renderExitManagerAlert(fallback);
+        }
+      }
+
+      function renderSchedulerHealth(h) {
+        const top = document.getElementById("schedulerHealthTop");
+        const meta = document.getElementById("schedulerHealthMeta");
+        top.classList.remove("good", "bad");
+        if (!h || !h.available) {
+          top.textContent = "UNAVAILABLE";
+          top.classList.add("bad");
+          meta.textContent = `Heartbeat: ${h && h.reason ? h.reason : "not available"}`;
+          return;
+        }
+        const status = String(h.status || "unknown").toUpperCase();
+        const age = Number(h.age_seconds ?? -1);
+        if (h.healthy) {
+          top.textContent = "HEALTHY";
+          top.classList.add("good");
+        } else {
+          top.textContent = status;
+          top.classList.add("bad");
+        }
+        const updatedAt = h.updated_at ? `${fmtEtTime(h.updated_at)} ET` : "--";
+        const pid = h.pid != null ? String(h.pid) : "--";
+        const cycle = Number(h.cycle_count || 0);
+        const ageText = age >= 0 ? `${age}s` : "--";
+        const mode = h.schedule_mode ? String(h.schedule_mode) : "--";
+        meta.textContent = `Heartbeat: ${updatedAt} | Age: ${ageText} | PID: ${pid} | Cycle: ${cycle} | Mode: ${mode}`;
+      }
+
+      function renderSchedulerAlert(h) {
+        const alert = document.getElementById("schedulerAlert");
+        if (!h || !h.available) {
+          alert.style.display = "block";
+          alert.textContent = "Scheduler alert: heartbeat unavailable.";
+          return;
+        }
+        if (h.healthy) {
+          alert.style.display = "none";
+          return;
+        }
+        const status = String(h.status || "unknown").toUpperCase();
+        const age = Number(h.age_seconds ?? -1);
+        const ageText = age >= 0 ? `${age}s` : "--";
+        const detail = h.error ? ` | Error: ${h.error}` : "";
+        alert.style.display = "block";
+        alert.textContent = `Scheduler alert: ${status} | Heartbeat age: ${ageText}${detail}`;
+      }
+
+      async function refreshSchedulerHealth() {
+        try {
+          const resp = await fetch("/api/live-dashboard/scheduler-health");
+          const health = await resp.json();
+          renderSchedulerHealth(health);
+          renderSchedulerAlert(health);
+        } catch (err) {
+          const fallback = { available: false, reason: err && err.message ? err.message : "fetch failed" };
+          renderSchedulerHealth(fallback);
+          renderSchedulerAlert(fallback);
+        }
+      }
+
       async function refresh() {
         const resp = await fetch("/api/live-dashboard");
         const data = await resp.json();
@@ -861,6 +1502,8 @@ LIVE_HTML = """
         renderFearClimate(data.fear_climate || {});
         document.getElementById("reserveStatus").textContent =
           `Reserve pot: ${fmt(s.reserve_balance)} | Pending request: ${fmt(s.reserve_target_request)}`;
+        await refreshExitManagerHealth();
+        await refreshSchedulerHealth();
       }
 
       async function refreshKraken() {
@@ -1084,6 +1727,16 @@ def api_set_fear_climate():
 def api_kill_switch():
     result = _kill_scheduler_processes()
     return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@app.get("/api/live-dashboard/exit-manager-health")
+def api_exit_manager_health():
+    return jsonify(_load_exit_manager_health())
+
+
+@app.get("/api/live-dashboard/scheduler-health")
+def api_scheduler_health():
+    return jsonify(_load_scheduler_health())
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,13 @@ def _parse_price(snapshot: dict[str, Any]) -> float | None:
 def _parse_iso_utc(value: str | None) -> datetime | None:
     if not value:
         return None
+
+
+def _floor_decimals(value: float, decimals: int) -> float:
+    if value <= 0:
+        return 0.0
+    scale = 10 ** max(decimals, 0)
+    return math.floor(value * scale) / scale
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
@@ -74,6 +82,12 @@ class ExitManager:
             hard_stop_loss_pct=float(hooks.get("hardStopLossPct", risk_policy.get("stopLossPct", 2.4))),
             min_notional_exit_usd=float(hooks.get("minNotionalExitUsd", 5.0)),
         )
+        reliability = risk_policy.get("exitReliability", {})
+        self.trigger_cooldown_seconds = int(reliability.get("triggerCooldownSeconds", 45))
+        self.insufficient_funds_backoff_seconds = int(reliability.get("insufficientFundsBackoffSeconds", 90))
+        self.generic_error_backoff_seconds = int(reliability.get("genericErrorBackoffSeconds", 45))
+        self.max_backoff_seconds = int(reliability.get("maxBackoffSeconds", 900))
+        self.crypto_min_sell_qty = float(reliability.get("cryptoMinSellQty", 0.00001))
 
     def _cfg_for_symbol(self, symbol: str) -> ExitConfig:
         hooks = dict(self.risk_policy.get("exitHooks", {}))
@@ -175,7 +189,7 @@ class ExitManager:
     def _sell_qty(self, symbol: str, total_qty: float, sell_pct: float) -> float:
         raw = total_qty * (sell_pct / 100.0)
         if _is_crypto_symbol(symbol):
-            qty = round(raw, 6)
+            qty = _floor_decimals(raw, 6)
             return max(qty, 0.0)
         qty_int = int(raw)
         if qty_int < 1 and total_qty >= 1:
@@ -185,7 +199,7 @@ class ExitManager:
     def _remaining_qty(self, symbol: str, total_qty: float, planned_qty: float) -> float:
         remaining = total_qty - planned_qty
         if _is_crypto_symbol(symbol):
-            return max(round(remaining, 6), 0.0)
+            return max(_floor_decimals(remaining, 6), 0.0)
         return float(max(int(remaining), 0))
 
     def _segment_value(self, key: str, symbol: str, default: float) -> float:
@@ -245,6 +259,9 @@ class ExitManager:
         symbols_state = self.state.setdefault("symbols", {})
         actions: list[dict[str, Any]] = []
         pdt_blocked_exits = 0
+        reliability_suppressed_backoff = 0
+        reliability_suppressed_cooldown = 0
+        reliability_suppressed_min_qty = 0
         now_utc = datetime.now(timezone.utc)
         active_symbols = {str(p.get("symbol") or "") for p in positions if p.get("symbol")}
 
@@ -304,12 +321,32 @@ class ExitManager:
 
             if not trigger or sell_qty <= 0:
                 continue
+
+            retry_after = _parse_iso_utc(str(symbol_state.get("retry_after") or ""))
+            if retry_after and retry_after > now_utc:
+                reliability_suppressed_backoff += 1
+                continue
             if _is_crypto_symbol(symbol):
                 symbol = self._normalize_crypto_symbol(symbol)
                 available_qty = max(float(available_crypto_qty.get(symbol, 0.0)), 0.0)
-                sell_qty = max(min(round(sell_qty, 6), round(available_qty, 6)), 0.0)
-                if sell_qty <= 0:
+                sell_qty = _floor_decimals(min(sell_qty, available_qty), 6)
+                if sell_qty <= 0 or sell_qty < self.crypto_min_sell_qty:
+                    symbol_state["retry_after"] = (now_utc + timedelta(seconds=self.insufficient_funds_backoff_seconds)).isoformat()
+                    symbol_state["last_error"] = "crypto_sell_qty_below_min_or_unavailable"
+                    reliability_suppressed_min_qty += 1
                     continue
+
+            last_trigger = str(symbol_state.get("last_trigger") or "")
+            last_attempt_at = _parse_iso_utc(str(symbol_state.get("last_attempt_at") or ""))
+            last_attempt_qty = float(symbol_state.get("last_attempt_qty") or 0.0)
+            if (
+                trigger == last_trigger
+                and last_attempt_at is not None
+                and (now_utc - last_attempt_at).total_seconds() < max(0, self.trigger_cooldown_seconds)
+                and abs(last_attempt_qty - sell_qty) <= 1e-6
+            ):
+                reliability_suppressed_cooldown += 1
+                continue
 
             # Near PDT limit, avoid same-day non-hard-stop exits for equities bought today.
             if (
@@ -340,6 +377,9 @@ class ExitManager:
                     )
                     if _is_crypto_symbol(symbol):
                         available_crypto_qty[symbol] = max(float(available_crypto_qty.get(symbol, 0.0)) - sell_qty, 0.0)
+                    symbol_state["retry_after"] = ""
+                    symbol_state["consecutive_exit_failures"] = 0
+                    symbol_state["last_error"] = ""
                 except Exception as err:
                     order_result = {
                         "ok": False,
@@ -349,8 +389,21 @@ class ExitManager:
                         "type": "market",
                         "error": str(err),
                     }
+                    error_text = str(err).lower()
+                    prev_failures = int(symbol_state.get("consecutive_exit_failures", 0)) + 1
+                    symbol_state["consecutive_exit_failures"] = prev_failures
+                    if "insufficient funds" in error_text:
+                        backoff = min(self.insufficient_funds_backoff_seconds * (2 ** max(prev_failures - 1, 0)), self.max_backoff_seconds)
+                    else:
+                        backoff = min(self.generic_error_backoff_seconds * (2 ** max(prev_failures - 1, 0)), self.max_backoff_seconds)
+                    symbol_state["retry_after"] = now_utc.isoformat() if backoff <= 0 else (now_utc + timedelta(seconds=backoff)).isoformat()
+                    symbol_state["last_error"] = str(err)
             else:
                 order_result = {"dry_run": True, "symbol": symbol, "qty": sell_qty, "side": "sell", "type": "market"}
+
+            symbol_state["last_trigger"] = trigger
+            symbol_state["last_attempt_at"] = now_utc.isoformat()
+            symbol_state["last_attempt_qty"] = sell_qty
 
             if trigger == "first_target_partial":
                 symbol_state["first_target_hit"] = True
@@ -401,6 +454,9 @@ class ExitManager:
             "positions": len(positions),
             "tracked_prices": len(prices),
             "actions": actions,
+            "reliability_suppressed_backoff": reliability_suppressed_backoff,
+            "reliability_suppressed_cooldown": reliability_suppressed_cooldown,
+            "reliability_suppressed_min_qty": reliability_suppressed_min_qty,
             "pdt_daytrade_count": daytrade_count,
             "pdt_threshold": pdt_threshold,
             "pdt_near_limit": pdt_near_limit,

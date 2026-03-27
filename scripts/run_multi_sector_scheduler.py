@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -20,6 +21,8 @@ from revenue_generator.fear_climate import load_fear_climate_state
 from revenue_generator.journal import TradeJournal
 from revenue_generator.kraken_client import KrakenClient
 
+SCHEDULER_HEARTBEAT_PATH = ROOT / "logs" / "scheduler_heartbeat.json"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run multi-sector recurring trading loop.")
@@ -28,6 +31,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick", type=int, default=10, help="Scheduler heartbeat seconds.")
     p.add_argument("--once", action="store_true", help="Run one cycle for each sector then exit.")
     return p.parse_args()
+
+
+def _write_scheduler_heartbeat(payload: dict[str, object]) -> None:
+    SCHEDULER_HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        **payload,
+    }
+    SCHEDULER_HEARTBEAT_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def _default_profiles() -> dict:
@@ -116,12 +128,23 @@ def main() -> int:
     last_run: dict[str, datetime] = {}
     stop = {"flag": False}
     last_schedule_mode: str | None = None
+    scheduler_cycles = 0
+    consecutive_errors = 0
 
     def _stop_handler(_signum, _frame):
         stop["flag"] = True
 
     signal.signal(signal.SIGINT, _stop_handler)
     signal.signal(signal.SIGTERM, _stop_handler)
+    _write_scheduler_heartbeat(
+        {
+            "pid": os.getpid(),
+            "status": "started",
+            "execute": bool(args.execute),
+            "tick_seconds": max(2, args.tick),
+            "consecutive_errors": consecutive_errors,
+        }
+    )
 
     def _combined_equity() -> float:
         try:
@@ -255,25 +278,127 @@ def main() -> int:
             if not profile.get("enabled", True):
                 continue
             _run_segment(segment, profile)
+        _write_scheduler_heartbeat(
+            {
+                "pid": os.getpid(),
+                "status": "ok",
+                "mode": "once",
+                "schedule_mode": schedule_mode,
+                "cycle_count": 1,
+                "consecutive_errors": 0,
+            }
+        )
         return 0
 
     print("Multi-sector scheduler started. Press Ctrl+C to stop.")
     while not stop["flag"]:
-        effective_profiles, schedule_mode = _effective_profiles_for_clock(profiles, policy.get("aiScheduler", {}))
-        if schedule_mode != last_schedule_mode:
-            print(f"Scheduler mode switched: {schedule_mode}")
-            last_schedule_mode = schedule_mode
-        now = datetime.now(timezone.utc)
-        for segment, profile in effective_profiles.items():
-            if not profile.get("enabled", True):
-                continue
-            interval = int(profile.get("intervalSeconds", 300))
-            previous = last_run.get(segment)
-            if previous is None or (now - previous).total_seconds() >= interval:
-                _run_segment(segment, profile)
-                last_run[segment] = now
+        loop_started = datetime.now(timezone.utc)
+        try:
+            effective_profiles, schedule_mode = _effective_profiles_for_clock(profiles, policy.get("aiScheduler", {}))
+            if schedule_mode != last_schedule_mode:
+                print(f"Scheduler mode switched: {schedule_mode}")
+                last_schedule_mode = schedule_mode
+            now = datetime.now(timezone.utc)
+            ran_segments: list[str] = []
+            for segment, profile in effective_profiles.items():
+                if not profile.get("enabled", True):
+                    continue
+                interval = int(profile.get("intervalSeconds", 300))
+                previous = last_run.get(segment)
+                if previous is None or (now - previous).total_seconds() >= interval:
+                    _run_segment(segment, profile)
+                    last_run[segment] = now
+                    ran_segments.append(segment)
+            scheduler_cycles += 1
+            consecutive_errors = 0
+            max_segment_interval = max([int(p.get("intervalSeconds", 300)) for p in effective_profiles.values()] or [300])
+            _write_scheduler_heartbeat(
+                {
+                    "pid": os.getpid(),
+                    "status": "ok",
+                    "execute": bool(args.execute),
+                    "schedule_mode": schedule_mode,
+                    "cycle_count": scheduler_cycles,
+                    "loop_started_at": loop_started.isoformat(),
+                    "ran_segments": ran_segments,
+                    "active_segments": [s for s, p in effective_profiles.items() if p.get("enabled", True)],
+                    "max_segment_interval_seconds": max_segment_interval,
+                    "stale_after_seconds": max(max_segment_interval * 2, max(2, args.tick) * 3),
+                    "consecutive_errors": consecutive_errors,
+                }
+            )
+        except Exception as err:
+            consecutive_errors += 1
+            print(
+                json.dumps(
+                    {
+                        "scheduler_watchdog_error": str(err),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "consecutive_errors": consecutive_errors,
+                    },
+                    indent=2,
+                )
+            )
+            _write_scheduler_heartbeat(
+                {
+                    "pid": os.getpid(),
+                    "status": "error",
+                    "execute": bool(args.execute),
+                    "cycle_count": scheduler_cycles,
+                    "loop_started_at": loop_started.isoformat(),
+                    "error": str(err),
+                    "consecutive_errors": consecutive_errors,
+                }
+            )
+            if consecutive_errors >= 3:
+                try:
+                    cfg = build_runtime_config()
+                    policy = ensure_risk_policy()
+                    alpaca_client = AlpacaClient(cfg=cfg)
+                    kraken_client = None
+                    crypto_broker = str(policy.get("cryptoBroker", "alpaca")).lower()
+                    if crypto_broker == "kraken":
+                        try:
+                            kraken_client = KrakenClient()
+                        except ValueError as inner_err:
+                            print(f"Kraken re-init failed ({inner_err}), falling back to Alpaca for crypto.")
+                            crypto_broker = "alpaca"
+                    profiles = policy.get("sectorCadence") or _default_profiles()
+                    consecutive_errors = 0
+                    print(json.dumps({"scheduler_watchdog_recovery": "runtime_reinitialized", "crypto_broker": crypto_broker}, indent=2))
+                    _write_scheduler_heartbeat(
+                        {
+                            "pid": os.getpid(),
+                            "status": "recovered",
+                            "execute": bool(args.execute),
+                            "cycle_count": scheduler_cycles,
+                            "crypto_broker": crypto_broker,
+                            "consecutive_errors": consecutive_errors,
+                        }
+                    )
+                except Exception as recover_err:
+                    print(json.dumps({"scheduler_watchdog_recovery_failed": str(recover_err)}, indent=2))
+                    _write_scheduler_heartbeat(
+                        {
+                            "pid": os.getpid(),
+                            "status": "recovery_failed",
+                            "execute": bool(args.execute),
+                            "cycle_count": scheduler_cycles,
+                            "error": str(recover_err),
+                            "consecutive_errors": consecutive_errors,
+                        }
+                    )
         time.sleep(max(2, args.tick))
 
+    _write_scheduler_heartbeat(
+        {
+            "pid": os.getpid(),
+            "status": "stopped",
+            "execute": bool(args.execute),
+            "cycle_count": scheduler_cycles,
+            "consecutive_errors": consecutive_errors,
+        }
+    )
     print("Stopped.")
     return 0
 
