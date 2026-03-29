@@ -1,463 +1,132 @@
-from __future__ import annotations
+"""
+External Research Module - Tuned for Agentic Momentum/Scalping Churn
+Provides dynamic candidates, technical signals, and market context.
+"""
 
-from datetime import datetime, timedelta, timezone
-from typing import Any
+import logging
+import yfinance as yf
+from datetime import datetime, timedelta
+import pandas as pd
+import json
+from typing import Dict, List, Any
 
-try:
-    import yfinance as yf
-except Exception:  # pragma: no cover
-    yf = None
+from .fear_climate import get_fear_climate
+from .config import load_risk_policy
 
+logger = logging.getLogger(__name__)
 
-CRYPTO_TO_YAHOO = {
-    "BTC/USD": "BTC-USD",
-    "ETH/USD": "ETH-USD",
-    "SOL/USD": "SOL-USD",
-    "AVAX/USD": "AVAX-USD",
-    "LTC/USD": "LTC-USD",
-    "LINK/USD": "LINK-USD",
-    "BCH/USD": "BCH-USD",
-    "UNI/USD": "UNI-USD",
-    "AAVE/USD": "AAVE-USD",
-    "DOGE/USD": "DOGE-USD",
-    "DOT/USD": "DOT-USD",
-    "SHIB/USD": "SHIB-USD",
-    "XTZ/USD": "XTZ-USD",
-    "MKR/USD": "MKR-USD",
-    "GRT/USD": "GRT-USD",
-    "BAT/USD": "BAT-USD",
-    "CRV/USD": "CRV-USD",
-    "SUSHI/USD": "SUSHI-USD",
-    "ALGO/USD": "ALGO-USD",
-}
-
-# Broader discovery seed universe. This is intentionally larger than static allowlists
-# but still constrained to liquid, recognizable names to avoid garbage scans.
-DISCOVERY_SEED_UNIVERSE: dict[str, list[str]] = {
-    "indexFunds": [
-        "SPY",
-        "QQQ",
-        "DIA",
-        "IWM",
-        "VTI",
-        "VOO",
-        "IVV",
-        "XLF",
-        "XLK",
-        "XLE",
-        "XLI",
-        "XLY",
-        "XLP",
-        "XLV",
-        "XLU",
-        "XLC",
-        "XLB",
-        "XLRE",
-        "SMH",
-        "SOXX",
-        "ARKK",
-        "SCHD",
-        "VUG",
-        "VTV",
-    ],
-    "largeCapStocks": [
-        "AAPL",
-        "MSFT",
-        "NVDA",
-        "AMZN",
-        "GOOGL",
-        "META",
-        "TSLA",
-        "AVGO",
-        "AMD",
-        "NFLX",
-        "ORCL",
-        "CRM",
-        "ADBE",
-        "QCOM",
-        "CSCO",
-        "INTC",
-        "MU",
-        "PLTR",
-        "UBER",
-        "SHOP",
-        "PANW",
-        "CRWD",
-        "SNOW",
-        "ANET",
-        "MELI",
-        "JPM",
-        "BAC",
-        "WFC",
-        "GS",
-        "MS",
-        "V",
-        "MA",
-        "PYPL",
-        "BRK.B",
-        "UNH",
-        "LLY",
-        "JNJ",
-        "PFE",
-        "MRK",
-        "ABBV",
-        "XOM",
-        "CVX",
-        "COP",
-        "CAT",
-        "DE",
-        "HON",
-        "GE",
-        "NOC",
-        "BA",
-        "LMT",
-        "DIS",
-        "CMCSA",
-        "TMUS",
-        "VZ",
-        "T",
-        "COST",
-        "WMT",
-        "HD",
-        "LOW",
-        "MCD",
-        "SBUX",
-        "NKE",
-        "KO",
-        "PEP",
-        "PG",
-        "TMO",
-        "ABT",
-        "DHR",
-    ],
-    "pennyStocks": [
-        "SNDL",
-        "TNXP",
-        "AEMD",
-        "CTRM",
-        "XELA",
-        "HSDT",
-        "MARA",
-        "RIOT",
-        "HUT",
-        "BITF",
-        "CIFR",
-        "WULF",
-        "IONQ",
-        "SOUN",
-        "MULN",
-        "BKKT",
-        "CLOV",
-        "SOFI",
-        "JOBY",
-        "ACHR",
-        "RKLB",
-        "ASTS",
-        "PLUG",
-        "LCID",
-        "FUBO",
-        "OPEN",
-        "RIVN",
-    ],
-    "crypto": [
-        "BTC/USD",
-        "ETH/USD",
-        "SOL/USD",
-        "AVAX/USD",
-        "LTC/USD",
-        "LINK/USD",
-        "BCH/USD",
-        "UNI/USD",
-        "AAVE/USD",
-        "DOGE/USD",
-        "DOT/USD",
-        "SHIB/USD",
-        "XTZ/USD",
-        "MKR/USD",
-        "GRT/USD",
-        "BAT/USD",
-        "CRV/USD",
-        "SUSHI/USD",
-        "ALGO/USD",
-    ],
-}
-
-_DISCOVERY_CACHE: dict[str, tuple[datetime, list[str]]] = {}
+# High-liquidity default watchlists (expand as needed)
+DEFAULT_STOCK_CANDIDATES = ["SPY", "QQQ", "IWM", "TSLA", "NVDA", "AAPL", "AMD", "META", "AMZN", "GOOGL", "MSFT", "SMCI"]
+DEFAULT_CRYPTO_CANDIDATES = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD"]
 
 
-def _to_float(v: Any, default: float = 0.0) -> float:
+def get_technical_signals(ticker: str, period: str = "5d", interval: str = "5m") -> Dict:
+    """Fetch short-term technicals for scalping/momentum decisions"""
     try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        if data.empty:
+            return {"error": "no_data"}
+
+        # Basic momentum indicators
+        data["returns"] = data["Close"].pct_change()
+        data["volume_surge"] = data["Volume"] / data["Volume"].rolling(20).mean()
+
+        latest = data.iloc[-1]
+        prev = data.iloc[-2] if len(data) > 1 else latest
+
+        rsi = None
+        try:
+            delta = data["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs)).iloc[-1]
+        except Exception:
+            pass
+
+        signal = {
+            "ticker": ticker,
+            "current_price": float(latest["Close"]),
+            "price_change_5m": float((latest["Close"] - prev["Close"]) / prev["Close"] * 100) if len(data) > 1 else 0,
+            "volume_surge_ratio": float(latest["volume_surge"]) if "volume_surge" in latest else 1.0,
+            "rsi": float(rsi) if rsi is not None else None,
+            "is_momentum": latest["Close"] > data["Close"].rolling(20).mean().iloc[-1],
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        return signal
+    except Exception as e:
+        logger.warning(f"Technical signals failed for {ticker}: {e}")
+        return {"ticker": ticker, "error": str(e)}
 
 
-def _rank_symbol(symbol: str, yahoo_symbol: str, *, period: str, interval: str) -> tuple[str, float]:
-    if yf is None:
-        return symbol, -999.0
-    ticker = yf.Ticker(yahoo_symbol)
-    hist = ticker.history(period=period, interval=interval, auto_adjust=False)
-    if hist is None or len(hist) < 3:
-        return symbol, -999.0
-    closes = hist["Close"].dropna()
-    vols = hist["Volume"].fillna(0)
-    if len(closes) < 3:
-        return symbol, -999.0
-    last = _to_float(closes.iloc[-1])
-    prev = _to_float(closes.iloc[-2], last)
-    base = _to_float(closes.iloc[-3], prev)
-    if base <= 0 or prev <= 0 or last <= 0:
-        return symbol, -999.0
-    ret1 = (last - prev) / prev
-    ret2 = (last - base) / base
-    vol_now = _to_float(vols.iloc[-1], 0)
-    vol_avg = _to_float(vols.tail(min(len(vols), 10)).mean(), 1.0)
-    vol_boost = min(max((vol_now / max(vol_avg, 1.0) - 1.0) * 0.1, -0.3), 0.3)
-    score = (ret1 * 0.65) + (ret2 * 0.35) + vol_boost
-    return symbol, score
+def get_segment_research(segment: str = "crypto", limit: int = 12) -> Dict[str, Any]:
+    """Main research function - returns rich candidates + signals for the agent"""
+    risk_policy = load_risk_policy()
+    fear = get_fear_climate()
 
+    regime = "aggressive" if fear.get("bullish", False) or fear.get("vix_level", 20) < 18 else "normal"
 
-def _score_and_filter_symbol(
-    symbol: str,
-    yahoo_symbol: str,
-    *,
-    period: str,
-    interval: str,
-    min_price: float,
-    min_dollar_volume: float,
-) -> tuple[str, float]:
-    if yf is None:
-        return symbol, -999.0
-    ticker = yf.Ticker(yahoo_symbol)
-    hist = ticker.history(period=period, interval=interval, auto_adjust=False)
-    if hist is None or len(hist) < 3:
-        return symbol, -999.0
-    closes = hist["Close"].dropna()
-    vols = hist["Volume"].fillna(0)
-    if len(closes) < 3:
-        return symbol, -999.0
-
-    last = _to_float(closes.iloc[-1], 0.0)
-    if last < min_price:
-        return symbol, -999.0
-    recent_n = min(len(closes), 10)
-    avg_close = _to_float(closes.tail(recent_n).mean(), 0.0)
-    avg_vol = _to_float(vols.tail(recent_n).mean(), 0.0)
-    avg_dollar_vol = avg_close * avg_vol
-    if avg_dollar_vol < min_dollar_volume:
-        return symbol, -999.0
-
-    prev = _to_float(closes.iloc[-2], last)
-    base = _to_float(closes.iloc[-3], prev)
-    if base <= 0 or prev <= 0 or last <= 0:
-        return symbol, -999.0
-    ret1 = (last - prev) / prev
-    ret2 = (last - base) / base
-    vol_now = _to_float(vols.iloc[-1], 0.0)
-    vol_boost = min(max((vol_now / max(avg_vol, 1.0) - 1.0) * 0.1, -0.3), 0.3)
-    score = (ret1 * 0.65) + (ret2 * 0.35) + vol_boost
-    return symbol, score
-
-
-def _current_vix() -> float | None:
-    if yf is None:
-        return None
-    ticker = yf.Ticker("^VIX")
-    hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-    if hist is None or len(hist) < 1:
-        return None
-    closes = hist["Close"].dropna()
-    if len(closes) < 1:
-        return None
-    return _to_float(closes.iloc[-1], 0.0)
-
-
-def get_current_vix() -> float | None:
-    return _current_vix()
-
-
-def should_skip_cycle_for_vix(
-    *,
-    segment: str,
-    risk_off_vix_ceiling: float,
-    risk_off_segments: list[str],
-    vix_value: float | None = None,
-) -> tuple[bool, float | None]:
-    segment_set = {str(s) for s in risk_off_segments}
-    if segment not in segment_set:
-        return False, vix_value
-    vix = _to_float(vix_value, 0.0) if vix_value is not None else _current_vix()
-    if vix is None:
-        return False, None
-    return vix > float(risk_off_vix_ceiling), vix
-
-
-def select_external_candidates(
-    *,
-    segment: str,
-    symbols: list[str],
-    top_n: int,
-    regime_vix_ceiling: float = 25.0,
-) -> list[str]:
-    if not symbols:
-        return []
-    skip, _vix = should_skip_cycle_for_vix(
-        segment=segment,
-        risk_off_vix_ceiling=regime_vix_ceiling,
-        risk_off_segments=["pennyStocks"],
-    )
-    if skip:
-        # Risk-off regime: skip penny candidates until volatility cools.
-        return []
-    scored: list[tuple[str, float]] = []
     if segment == "crypto":
-        for sym in symbols:
-            yahoo_sym = CRYPTO_TO_YAHOO.get(sym)
-            if not yahoo_sym:
-                continue
-            scored.append(_rank_symbol(sym, yahoo_sym, period="7d", interval="1h"))
+        candidates = DEFAULT_CRYPTO_CANDIDATES[:limit]
+        min_liquidity = risk_policy.get("default", {}).get("crypto", {}).get("min_notional_usd", 80)
     else:
-        # Equities and ETFs
-        for sym in symbols:
-            scored.append(_rank_symbol(sym, sym, period="1mo", interval="1d"))
+        candidates = DEFAULT_STOCK_CANDIDATES[:limit]
+        min_liquidity = risk_policy.get("default", {}).get("stocks", {}).get("min_notional_usd", 350)
 
-    if not scored:
-        return symbols[:top_n]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    selected = [sym for sym, score in scored if score > -999.0]
-    if not selected:
-        return symbols[:top_n]
-    return selected[:top_n]
+    research = {
+        "segment": segment,
+        "regime": regime,
+        "fear_climate": fear,
+        "timestamp": datetime.utcnow().isoformat(),
+        "candidates": [],
+        "market_context": "Green tape momentum mode active" if regime == "aggressive" else "Neutral regime",
+    }
 
+    for ticker in candidates:
+        tech = get_technical_signals(ticker, period="2d", interval="5m" if segment == "crypto" else "15m")
 
-def discover_segment_candidates(
-    *,
-    segment: str,
-    base_symbols: list[str],
-    top_n: int,
-    discovery_cfg: dict[str, Any] | None = None,
-    kraken_client: Any | None = None,
-) -> list[str]:
-    cfg = discovery_cfg or {}
-    if not bool(cfg.get("enabled", False)):
-        return base_symbols[:top_n]
-
-    cache_minutes = int(cfg.get("cacheMinutes", 10))
-    cache_key = f"{segment}:{top_n}"
-    now = datetime.now(timezone.utc)
-    cached = _DISCOVERY_CACHE.get(cache_key)
-    if cached and (now - cached[0]) <= timedelta(minutes=max(cache_minutes, 1)):
-        return cached[1]
-
-    if segment == "crypto" and kraken_client is not None:
-        return _discover_crypto_via_kraken(
-            kraken_client=kraken_client,
-            base_symbols=base_symbols,
-            top_n=top_n,
-            cfg=cfg,
-            cache_key=cache_key,
-        )
-
-    seed = DISCOVERY_SEED_UNIVERSE.get(segment, [])
-    merged_symbols: list[str] = []
-    seen: set[str] = set()
-    for symbol in [*base_symbols, *seed]:
-        sym = str(symbol or "").strip().upper()
-        if not sym or sym in seen:
+        if "error" in tech:
             continue
-        seen.add(sym)
-        merged_symbols.append(sym)
 
-    max_scan = int(cfg.get("maxSymbolsToScan", 160))
-    scan_symbols = merged_symbols[: max(max_scan, top_n)]
-    min_price_by_segment = cfg.get("minPriceUsdBySegment", {})
-    min_dollar_by_segment = cfg.get("minDollarVolumeUsdBySegment", {})
-    default_min_price = 2.0 if segment == "pennyStocks" else 10.0
-    default_min_dollar = 2_000_000.0 if segment == "pennyStocks" else 20_000_000.0
-    min_price = float(
-        (min_price_by_segment.get(segment) if isinstance(min_price_by_segment, dict) else None)
-        or cfg.get("minPriceUsd", default_min_price)
-    )
-    min_dollar_volume = float(
-        (min_dollar_by_segment.get(segment) if isinstance(min_dollar_by_segment, dict) else None)
-        or cfg.get("minDollarVolumeUsd", default_min_dollar)
-    )
+        # Filter for momentum/scalping opportunities
+        volume_ok = tech.get("volume_surge_ratio", 1.0) > 1.3
+        momentum_ok = tech.get("is_momentum", False) or (tech.get("price_change_5m", 0) > 0.3)
+        rsi_ok = (tech.get("rsi") is None) or (30 < tech.get("rsi", 50) < 75)  # Avoid extremes but allow momentum
 
-    scored: list[tuple[str, float]] = []
-    if segment == "crypto":
-        for sym in scan_symbols:
-            yahoo_sym = CRYPTO_TO_YAHOO.get(sym)
-            if not yahoo_sym:
-                continue
-            scored.append(
-                _score_and_filter_symbol(
-                    sym,
-                    yahoo_sym,
-                    period="7d",
-                    interval="1h",
-                    min_price=min_price,
-                    min_dollar_volume=min_dollar_volume,
-                )
-            )
-    else:
-        for sym in scan_symbols:
-            scored.append(
-                _score_and_filter_symbol(
-                    sym,
-                    sym,
-                    period="1mo",
-                    interval="1d",
-                    min_price=min_price,
-                    min_dollar_volume=min_dollar_volume,
-                )
+        if regime == "aggressive" or (volume_ok and momentum_ok and rsi_ok):
+            research["candidates"].append(
+                {
+                    "ticker": ticker,
+                    "price": tech["current_price"],
+                    "momentum_score": round(tech.get("price_change_5m", 0) * tech.get("volume_surge_ratio", 1.0), 2),
+                    "rsi": tech.get("rsi"),
+                    "volume_surge": round(tech.get("volume_surge_ratio", 1.0), 2),
+                    "short_term_bias": "bullish" if tech.get("price_change_5m", 0) > 0 else "bearish",
+                }
             )
 
-    scored = [row for row in scored if row[1] > -999.0]
-    if not scored:
-        fallback = base_symbols[:top_n]
-        _DISCOVERY_CACHE[cache_key] = (now, fallback)
-        return fallback
+    # Sort by momentum score for agent priority
+    research["candidates"].sort(key=lambda x: x.get("momentum_score", 0), reverse=True)
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    selected = [sym for sym, _score in scored[:top_n]]
-    _DISCOVERY_CACHE[cache_key] = (now, selected)
-    return selected
+    logger.info(f"Research completed for {segment}: {len(research['candidates'])} momentum candidates in {regime} regime")
+    return research
 
 
-def _discover_crypto_via_kraken(
-    *,
-    kraken_client: Any,
-    base_symbols: list[str],
-    top_n: int,
-    cfg: dict[str, Any],
-    cache_key: str,
-) -> list[str]:
-    """Scan all Kraken USD pairs, score by volume * range, return top candidates."""
-    now = datetime.now(timezone.utc)
-    min_vol_usd = float(cfg.get("minDollarVolumeUsdBySegment", {}).get("crypto", 50_000))
+def get_latest_news(ticker: str) -> List[Dict]:
+    """Basic news fetch (expand with paid API if needed later)"""
     try:
-        candidates = kraken_client.discover_tradeable_pairs(
-            min_24h_volume_usd=min_vol_usd,
-            top_n=max(top_n * 3, 80),
-        )
+        ticker_obj = yf.Ticker(ticker)
+        news = ticker_obj.news[:5]  # yfinance news
+        return [{"title": item.get("title"), "publisher": item.get("publisher"), "time": item.get("providerPublishTime")} for item in news]
     except Exception:
-        fallback = base_symbols[:top_n]
-        _DISCOVERY_CACHE[cache_key] = (now, fallback)
-        return fallback
+        return []
 
-    if not candidates:
-        fallback = base_symbols[:top_n]
-        _DISCOVERY_CACHE[cache_key] = (now, fallback)
-        return fallback
 
-    scored: list[tuple[str, float]] = []
-    for c in candidates:
-        vol = c.get("volume_usd_24h", 0)
-        range_pct = c.get("range_pct_24h", 0)
-        score = (vol / 1_000_000) * max(range_pct, 0.1)
-        scored.append((c["symbol"], score))
+# For direct tool use in agent
+def get_fear_climate_wrapper():
+    return get_fear_climate()
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    selected = [sym for sym, _ in scored[:top_n]]
-    _DISCOVERY_CACHE[cache_key] = (now, selected)
-    return selected
+
+# Keep backward compatibility
+def get_research_for_segment(segment: str = "crypto"):
+    return get_segment_research(segment)
