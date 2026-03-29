@@ -186,38 +186,41 @@ def build_ai_prompt(
     rule_based_signals: list[dict[str, Any]] | None = None,
     market_context: str = "",
 ) -> str:
+    # Extract risk parameters (same as current)
     max_pos_by_segment = risk_policy.get("maxPositionSizePctBySegment", {})
-    max_pos = float(max_pos_by_segment.get(segment, risk_policy.get("maxPositionSizePct", 8.0))) if isinstance(max_pos_by_segment, dict) else float(risk_policy.get("maxPositionSizePct", 8.0))
+    max_pos = float(max_pos_by_segment.get(segment, risk_policy.get("maxPositionSizePct", 8.0)))
     max_open = int(risk_policy.get("maxOpenPositions", 15))
     stop_loss = float(risk_policy.get("stopLossPct", 2.2))
-    tp1 = float((risk_policy.get("exitHooks") or {}).get("firstTargetPct", 3.0))
-    tp2 = float((risk_policy.get("exitHooks") or {}).get("secondTargetPct", 6.0))
+    exit_hooks = risk_policy.get("exitHooks") or {}
+    tp1 = float(exit_hooks.get("firstTargetPct", 3.0))
+    tp2 = float(exit_hooks.get("secondTargetPct", 6.0))
+    trailing_stop = float(exit_hooks.get("trailingStopPct", 2.0))
+
     ai_cfg = risk_policy.get("aiScheduler", {})
     min_conf_by_segment = ai_cfg.get("minConfidenceForBuyBySegment", {})
     min_edge_by_segment = ai_cfg.get("minExpectedEdgeForBuyBySegment", {})
     min_net_edge_by_segment = ai_cfg.get("minExpectedEdgeNetForBuyBySegment", {})
-    min_conf = float(min_conf_by_segment.get(segment, ai_cfg.get("minConfidenceForBuy", 0.70))) if isinstance(min_conf_by_segment, dict) else float(ai_cfg.get("minConfidenceForBuy", 0.70))
-    min_edge = float(min_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeForBuy", 0.05))) if isinstance(min_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeForBuy", 0.05))
-    min_net_edge = float(min_net_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))) if isinstance(min_net_edge_by_segment, dict) else float(ai_cfg.get("minExpectedEdgeNetForBuy", max(min_edge, 0.0)))
-    trailing_stop = float((risk_policy.get("exitHooks") or {}).get("trailingStopPct", 1.8))
-    segment_cfg = (risk_policy.get("allowedSegments") or {}).get(segment, {})
-    est_spread_bps = float(segment_cfg.get("maxSpreadBps", 40)) * 0.35
-    est_slippage_bps = float(
-        ai_cfg.get("slippageBufferBpsCrypto", 12.0) if segment == "crypto" else ai_cfg.get("slippageBufferBpsStocks", 6.0)
-    )
-    est_cost_bps = est_spread_bps + est_slippage_bps
 
+    min_conf = float(min_conf_by_segment.get(segment, ai_cfg.get("minConfidenceForBuy", 0.75)))
+    min_edge = float(min_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeForBuy", 0.03)))
+    min_net_edge = float(min_net_edge_by_segment.get(segment, ai_cfg.get("minExpectedEdgeNetForBuy", 0.015)))
+
+    est_cost_bps = 25 if segment == "penny" else 8  # realistic slippage/spread estimate
+
+    # Build rule context
     rule_context = ""
     if rule_based_signals:
-        rule_context = (
-            "\nRule-based preliminary signals (use as strong prior, but override if you see better edge):\n"
-            + json.dumps(rule_based_signals, indent=2)
-        )
+        rule_context = "Rule-based signals (use as strong prior):\n"
+        for sig in rule_based_signals[:8]:  # limit to avoid token bloat
+            conf = _to_float(sig.get("confidence"))
+            edge = _to_float(sig.get("expected_edge"))
+            rule_context += f"- {sig.get('symbol')}: conf={conf:.2f}, edge={edge:.3f}, reason={sig.get('reason','')}\n"
 
-    return f"""
-You are an elite, conservative-yet-opportunistic trading signal generator for live execution on Alpaca and kraken. Your only goal is to generate the highest-probability, positive-expectancy trades while strictly respecting risk limits.
+    # Market context is passed in (already rich)
 
-Segment: {segment} (if penny stocks, be extremely skeptical of pumps without real volume + catalyst).
+    prompt = f"""You are an elite, conservative-yet-opportunistic trading signal generator for live Alpaca execution. Your goal: maximize positive-expectancy trades while strictly respecting all risk limits.
+
+Segment: {segment} (be extra skeptical on penny stocks — require real catalyst + volume confirmation, ignore random pumps).
 
 Current budget: ${budget:.2f}
 Max position size: {max_pos:.2f}% of budget
@@ -225,74 +228,75 @@ Max open positions: {max_open}
 Allowed symbols: {", ".join(allowed_symbols)}
 Hard stop-loss: -{stop_loss:.2f}%
 First target: +{tp1:.2f}% (scale out 40%)
-Second target: +{tp2:.2f}% (scale out another 30%)
+Second target: +{tp2:.2f}% (scale out 30%)
 Trailing stop: {trailing_stop:.1f}%
 
 {rule_context}
 
 {market_context}
 
-=== STRICT LIVE TRADING RULES ===
-- ONLY BUY if you see a **clear, realistic positive edge** AFTER spreads, slippage, and commissions.
-- Minimums: confidence ≥ {min_conf:.2f}, gross expected_edge ≥ {min_edge:.2f}, **net** expected_edge (after ~{est_cost_bps:.0f} bps costs) ≥ {min_net_edge:.4f}.
-- The setup must have favorable risk/reward vs your actual stop-loss and targets.
-- For penny stocks: require strong volume confirmation + catalyst. Ignore random spikes.
-- If multiple symbols qualify, pick the single highest-conviction one only.
-- If the edge is marginal, choppy, or manipulated → return HOLD.
+=== STRICT LIVE RULES ===
+- ONLY output BUY if there is a **clear realistic edge** AFTER spreads, slippage, and commissions.
+- Requirements: confidence ≥ {min_conf:.2f}, gross expected_edge ≥ {min_edge:.2f}, net expected_edge (after ~{est_cost_bps} bps costs) ≥ {min_net_edge:.4f}.
+- Setup must show favorable risk/reward aligned with your stop-loss and targets.
+- If multiple candidates qualify, select ONLY the single highest-conviction one.
+- For penny stocks: demand strong volume surge + catalyst. Low-volume spikes = HOLD.
+- Marginal, choppy, or manipulated setups → HOLD.
 - Never exceed position limits or use unlisted symbols.
 
-=== OUTPUT ONLY VALID JSON (no other text) ===
+=== OUTPUT ONLY VALID JSON (nothing else) ===
 {{
   "decision": "BUY|HOLD",
   "symbol": "SYMBOL_OR_NULL",
   "segment": "{segment}",
-  "confidence": 0.85,
-  "expected_edge": 0.042,
-  "position_size_pct_of_budget": 4.5,
+  "confidence": 0.0,
+  "expected_edge": 0.0,
+  "position_size_pct_of_budget": 0.0,
   "entry": {{
     "order_type": "limit|market",
     "limit_price": 0.0,
     "time_in_force": "gtc|day"
   }},
-  "reasoning": ["bullet 1", "bullet 2", "bullet 3"]
+  "reasoning": ["short bullet 1", "short bullet 2", "short bullet 3"]
 }}
 
 === FEW-SHOT EXAMPLES ===
 
-Example 1 — Strong BUY:
+Strong BUY example:
 {{
   "decision": "BUY",
   "symbol": "AAPL",
   "segment": "stocks",
-  "confidence": 0.88,
-  "expected_edge": 0.065,
-  "position_size_pct_of_budget": 5.0,
+  "confidence": 0.87,
+  "expected_edge": 0.058,
+  "position_size_pct_of_budget": 5.2,
   "entry": {{"order_type": "limit", "limit_price": 0.0, "time_in_force": "gtc"}},
   "reasoning": [
-    "1d +4.2% on above-average volume, 5d +11.8%",
-    "Clear breakout above resistance with institutional accumulation signals",
-    "Risk/reward 1:2.8 vs stop-loss and targets — net edge after costs = +6.1%"
+    "Strong momentum: +4.8% 1d on 2.3x avg volume, breakout above resistance",
+    "Rule signal + market context align, risk/reward ~1:2.9 vs stop and targets",
+    "Net edge after costs = +5.4% — highest conviction setup"
   ]
 }}
 
-Example 2 — HOLD:
+Safe HOLD example:
 {{
   "decision": "HOLD",
   "symbol": null,
   "segment": "crypto",
-  "confidence": 0.45,
-  "expected_edge": 0.008,
+  "confidence": 0.48,
+  "expected_edge": 0.009,
   "position_size_pct_of_budget": 0.0,
   "entry": {{"order_type": "limit", "limit_price": 0.0, "time_in_force": "gtc"}},
   "reasoning": [
-    "Sideways price action, low volume, no catalyst",
-    "Expected edge does not clear cost hurdle after slippage",
-    "Better opportunities exist elsewhere"
+    "Choppy price action, volume not confirming",
+    "Edge fails to clear cost hurdle after slippage",
+    "No catalyst — better to wait"
   ]
 }}
 
-Now analyze the data above and output only JSON.
-""".strip()
+Now analyze the rule signals and market data above. Output ONLY the JSON.
+"""
+    return prompt.strip()
 
 
 def build_ai_exit_prompt(
