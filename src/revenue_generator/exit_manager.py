@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ from .equity_mode import apply_equity_mode_switch
 from .journal import TradeJournal
 from .ai_bridge import analyze_segment  # for agentic exit decisions
 from .risk import get_regime  # reuse from risk.py
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -216,9 +219,9 @@ class ExitManager:
         if dry_run:
             logger.info(f"DRY-RUN EXIT: Sell {qty} {symbol} | {reason}")
             return
-        # Real exit logic using client.submit_order (sell)
+        # Real exit logic using client.place_order (sell)
         try:
-            self.client.submit_order(symbol=symbol, qty=qty, side="sell", type="market")
+            self.client.place_order(symbol=symbol, qty=qty, side="sell", order_type="market", tif="gtc" if _is_crypto_symbol(symbol) else "day")
             logger.info(f"EXECUTED EXIT: {reason} for {qty} {symbol}")
         except Exception as e:
             logger.error(f"Exit failed for {symbol}: {e}")
@@ -234,6 +237,18 @@ class ExitManager:
 
     # Add other helper methods from original as needed (e.g., _normalize_crypto_symbol, run loop, etc.)
     # For completeness, you can keep any additional methods from your current file that aren't overridden.
+
+    def run_cycle(self, execute: bool = False) -> dict[str, Any]:
+        actions = self.evaluate_and_execute_exits(dry_run=not execute)
+        return {
+            "positions": len(self._all_open_positions()),
+            "actions": actions,
+            "ai_advisor_calls": 0,
+            "ai_advisor_deferrals": 0,
+            "reliability_suppressed_backoff": 0,
+            "reliability_suppressed_cooldown": 0,
+            "reliability_suppressed_min_qty": 0,
+        }
 
 
 # Backward compatibility wrapper

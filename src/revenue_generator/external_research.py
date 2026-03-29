@@ -5,9 +5,8 @@ Provides dynamic candidates, technical signals, and market context.
 
 import logging
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
-import json
 from typing import Dict, List, Any
 
 from .fear_climate import get_fear_climate
@@ -20,6 +19,25 @@ DEFAULT_STOCK_CANDIDATES = ["SPY", "QQQ", "IWM", "TSLA", "NVDA", "AAPL", "AMD", 
 DEFAULT_CRYPTO_CANDIDATES = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD"]
 
 
+def _scalar(value: Any, default: float = 0.0) -> float:
+    """Normalize pandas/numpy scalar-ish values to a float."""
+    if value is None:
+        return default
+    if isinstance(value, pd.Series):
+        if value.empty:
+            return default
+        value = value.iloc[-1]
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def get_technical_signals(ticker: str, period: str = "5d", interval: str = "5m") -> Dict:
     """Fetch short-term technicals for scalping/momentum decisions"""
     try:
@@ -28,29 +46,40 @@ def get_technical_signals(ticker: str, period: str = "5d", interval: str = "5m")
             return {"error": "no_data"}
 
         # Basic momentum indicators
-        data["returns"] = data["Close"].pct_change()
-        data["volume_surge"] = data["Volume"] / data["Volume"].rolling(20).mean()
+        close_series = data["Close"]
+        volume_series = data["Volume"]
+        if isinstance(close_series, pd.DataFrame):
+            close_series = close_series.iloc[:, -1]
+        if isinstance(volume_series, pd.DataFrame):
+            volume_series = volume_series.iloc[:, -1]
+
+        data["returns"] = close_series.pct_change()
+        data["volume_surge"] = volume_series / volume_series.rolling(20).mean()
 
         latest = data.iloc[-1]
         prev = data.iloc[-2] if len(data) > 1 else latest
 
         rsi = None
         try:
-            delta = data["Close"].diff()
+            delta = close_series.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
             rs = gain / loss
-            rsi = 100 - (100 / (1 + rs)).iloc[-1]
+            rsi = _scalar((100 - (100 / (1 + rs))).iloc[-1], 50.0)
         except Exception:
             pass
 
+        latest_close = _scalar(latest["Close"], 0.0)
+        prev_close = _scalar(prev["Close"], latest_close)
+        volume_surge = _scalar(latest.get("volume_surge"), 1.0)
+        rolling_mean_20 = _scalar(close_series.rolling(20).mean().iloc[-1], latest_close)
         signal = {
             "ticker": ticker,
-            "current_price": float(latest["Close"]),
-            "price_change_5m": float((latest["Close"] - prev["Close"]) / prev["Close"] * 100) if len(data) > 1 else 0,
-            "volume_surge_ratio": float(latest["volume_surge"]) if "volume_surge" in latest else 1.0,
+            "current_price": latest_close,
+            "price_change_5m": ((latest_close - prev_close) / prev_close * 100.0) if len(data) > 1 and prev_close > 0 else 0.0,
+            "volume_surge_ratio": volume_surge,
             "rsi": float(rsi) if rsi is not None else None,
-            "is_momentum": latest["Close"] > data["Close"].rolling(20).mean().iloc[-1],
+            "is_momentum": latest_close > rolling_mean_20,
             "timestamp": datetime.utcnow().isoformat(),
         }
         return signal

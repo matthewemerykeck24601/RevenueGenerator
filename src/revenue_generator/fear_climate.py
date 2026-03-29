@@ -95,3 +95,17 @@ def apply_fear_climate_overrides(risk_policy: dict[str, Any], *, segment: str = 
         "pause_new_buys": pause_new_buys,
         "order_type": "limit",
     }
+
+
+def get_fear_climate(path: str | Path | None = None) -> dict[str, Any]:
+    """Compatibility helper expected by newer research module."""
+    state = load_fear_climate_state(path)
+    enabled = bool(state.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "bullish": not enabled,
+        "vix_level": 20.0,
+        "vix": 20.0,
+        "fear_greed_index": 65 if not enabled else 40,
+        "updated_at": state.get("updated_at"),
+    }

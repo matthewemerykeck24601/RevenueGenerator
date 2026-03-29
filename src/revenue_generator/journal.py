@@ -151,6 +151,25 @@ class TradeJournal:
     def close(self):
         self.conn.close()
 
+    def log_cycle(self, result: Dict[str, Any]):
+        """Backward-compatible cycle logger for scheduler/UI callers."""
+        planned = result.get("orders_planned", []) if isinstance(result, dict) else []
+        segment = str(result.get("segment", "unknown")) if isinstance(result, dict) else "unknown"
+        for order in planned if isinstance(planned, list) else []:
+            if not isinstance(order, dict):
+                continue
+            signal = {
+                "ticker": order.get("symbol", ""),
+                "segment": segment,
+                "action": "BUY",
+                "qty": order.get("qty", 0.0),
+                "price": order.get("limit_price", 0.0),
+                "size_percent": order.get("size_percent", 0.0),
+                "confidence": order.get("confidence", 0.0),
+                "edge_percent": order.get("edge", order.get("expected_edge", 0.0)),
+            }
+            self.log_trade_signal(signal, approved=True, rationale=str(order.get("rationale", "cycle_order")))
+
 
 # Global instance (singleton style)
 journal = TradeJournal()

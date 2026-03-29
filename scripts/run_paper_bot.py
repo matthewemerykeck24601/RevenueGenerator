@@ -6,13 +6,20 @@ Test the full agentic loop (research -> AI agent -> risk gate -> execute -> exit
 import argparse
 import time
 import logging
+import sys
 from datetime import datetime
+from pathlib import Path
 
-from src.revenue_generator.bot import RevenueBot
-from src.revenue_generator.alpaca_client import AlpacaClient
-from src.revenue_generator.exit_manager import ExitManager
-from src.revenue_generator.config import load_risk_policy
-from src.revenue_generator.journal import TradeJournal
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from revenue_generator.bot import RevenueBot
+from revenue_generator.alpaca_client import AlpacaClient
+from revenue_generator.exit_manager import ExitManager
+from revenue_generator.config import build_runtime_config, load_risk_policy
+from revenue_generator.journal import TradeJournal
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -49,7 +56,8 @@ def main():
     logger.info(f"Segment: {args.segment} | Cycles: {args.cycles} | Interval: {args.interval}s")
 
     risk_policy = load_risk_policy()
-    client = AlpacaClient()  # Ensure your .env is loaded with paper keys
+    cfg = build_runtime_config()
+    client = AlpacaClient(cfg=cfg)  # Ensure your .env is loaded with paper keys
     journal = TradeJournal()
 
     # Exit manager (dry_run=True for paper)

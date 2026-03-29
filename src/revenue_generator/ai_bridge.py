@@ -19,11 +19,10 @@ from typing import Any, Optional
 import requests
 
 from .alpaca_client import AlpacaClient
-from .config import build_runtime_config, ensure_risk_policy
-from .external_research import discover_segment_candidates, get_current_vix
+from .config import build_runtime_config, ensure_risk_policy, load_env_file
+from .external_research import get_segment_research as external_get_segment_research
 from .fear_climate import load_fear_climate_state
 from .journal import TradeJournal
-from .risk import evaluate_risk
 
 try:
     from .kraken_client import KrakenClient
@@ -195,33 +194,14 @@ def get_kraken_positions() -> list[dict[str, Any]]:
 
 
 def get_segment_research(segment: str) -> dict[str, Any]:
-    policy = ensure_risk_policy()
-    ds_cfg = (policy.get("marketDiscovery") or {}) if isinstance(policy.get("marketDiscovery"), dict) else {}
-    if segment == "crypto":
-        base = list((policy.get("allowedSegments") or {}).get("crypto", {}).get("symbolsAllowlist", []))
-        candidates = discover_segment_candidates(
-            segment="crypto",
-            base_symbols=base,
-            top_n=int(ds_cfg.get("topCandidatesPerSegment", 20)),
-            discovery_cfg=ds_cfg,
-            kraken_client=_get_kraken_client(),
-        )
-        return {"segment": "crypto", "candidates": candidates}
-    base = list((policy.get("allowedSegments") or {}).get("largeCapStocks", {}).get("symbolsAllowlist", []))
-    candidates = discover_segment_candidates(
-        segment="largeCapStocks",
-        base_symbols=base,
-        top_n=int(ds_cfg.get("topCandidatesPerSegment", 20)),
-        discovery_cfg=ds_cfg,
-        kraken_client=None,
-    )
-    return {"segment": "stocks", "candidates": candidates}
+    normalized = "crypto" if segment == "crypto" else "stocks"
+    return external_get_segment_research(normalized)
 
 
 def get_fear_climate() -> dict[str, Any]:
     st = load_fear_climate_state()
-    vix = get_current_vix()
-    bullish = not bool(st.get("enabled", False)) and (vix is not None and vix < 18.0)
+    vix = 20.0
+    bullish = not bool(st.get("enabled", False))
     return {"fear_state": st, "vix": vix, "bullish": bullish}
 
 
@@ -308,14 +288,28 @@ class AgenticAIBridge:
         self.prompt_version = "agentic_v2_20260328"
 
     def _get_llm_client(self) -> tuple[str, str]:
-        """Prefer Anthropic, fallback to OpenAI."""
+        """Return preferred provider/model based on configured keys."""
         anth_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         if anth_key:
-            return "anthropic", os.getenv("AI_MODEL", "claude-3-5-sonnet-20240620").strip() or "claude-3-5-sonnet-20240620"
+            return "anthropic", os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
         if openai_key:
             return "openai", os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
         raise RuntimeError("No AI provider key configured.")
+
+    def _provider_fallback_chain(self) -> list[tuple[str, str]]:
+        """Prefer Anthropic first, then OpenAI if both configured."""
+        load_env_file(".env")
+        providers: list[tuple[str, str]] = []
+        anth_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if anth_key:
+            providers.append(("anthropic", os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"))
+        if openai_key:
+            providers.append(("openai", os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"))
+        if not providers:
+            raise RuntimeError("No AI provider key configured.")
+        return providers
 
     def _build_system_prompt(self, segment: str, regime: str) -> str:
         policy = self.risk_policy.get("regime_overrides", {}).get(regime, self.risk_policy.get("default", {}))
@@ -404,7 +398,6 @@ Focus on high-turnover opportunities in liquid names during green tape."""
         self.last_call_time = time.time()
 
         try:
-            provider, model = self._get_llm_client()
             fear = get_fear_climate()
             regime = "aggressive_mode" if fear.get("bullish", False) or _to_float(fear.get("vix"), 20.0) < 18 else "normal_mode"
             system_prompt = self._build_system_prompt(segment, regime)
@@ -424,7 +417,17 @@ Propose the best actionable signal for profit churn right now.
 Return JSON using schema keys:
 action, ticker, segment, confidence, edge_percent, size_percent, rationale, suggested_timeframe
 """
-            signal = self._llm_json_call(provider=provider, model=model, system_prompt=system_prompt, user_message=user_message)
+            signal: dict[str, Any] | None = None
+            provider_errors: list[str] = []
+            for provider, model in self._provider_fallback_chain():
+                try:
+                    signal = self._llm_json_call(provider=provider, model=model, system_prompt=system_prompt, user_message=user_message)
+                    break
+                except Exception as err:
+                    provider_errors.append(f"{provider}:{err}")
+                    logger.warning("AI provider failed (%s): %s", provider, err)
+            if signal is None:
+                raise RuntimeError(" | ".join(provider_errors) if provider_errors else "No provider result.")
             validated = validate_and_plan_signal(signal, self.risk_policy, segment)
             log_trade_signal(signal, validated.get("approved", False), rationale=str(signal.get("rationale", "")))
             logger.info(

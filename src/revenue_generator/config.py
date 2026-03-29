@@ -53,3 +53,8 @@ def ensure_risk_policy(path: str = "config/risk_policy.json") -> dict[str, Any]:
     if policy_path.exists():
         return load_json(str(policy_path))
     return load_json("config/risk_policy.example.json")
+
+
+def load_risk_policy(path: str = "config/risk_policy.json") -> dict[str, Any]:
+    """Backward-compatible alias used by newer refactor modules."""
+    return ensure_risk_policy(path)

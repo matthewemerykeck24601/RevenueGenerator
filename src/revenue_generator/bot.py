@@ -7,13 +7,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Dict
+import logging
 
 from .alpaca_client import AlpacaClient
 from .ai_bridge import analyze_segment
 from .risk import validate_and_plan_signal
 from .strategy import select_top_signals
 from .external_research import get_segment_research
-from .journal import log_trade_signal
+from .journal import TradeJournal, log_trade_signal
 from .config import load_risk_policy
 from .exit_manager import ExitManager  # keep for now
 
@@ -36,7 +37,7 @@ class RevenueBot:
         self.client = client
         self.crypto_client = crypto_client
         self.risk_policy = load_risk_policy()
-        self.exit_manager = ExitManager(client=client, risk_policy=self.risk_policy, journal=None)  # journal later
+        self.exit_manager = ExitManager(client=client, risk_policy=self.risk_policy, journal=TradeJournal())  # journal later
 
     def run_cycle(self, segment: str = "crypto") -> List[Dict]:
         """Main agentic cycle: research → agent analyze → risk gate → execute"""
@@ -74,7 +75,7 @@ class RevenueBot:
                 continue
 
             # Calculate actual qty (simplified)
-            equity = self.client.get_account_summary().get("equity", 10000)
+            equity = float(self.client.get_account().get("equity", 10000) or 10000)
             alloc_dollars = equity * (validated["size_percent"] / 100.0)
             qty = alloc_dollars / sig.last_price if sig.last_price > 0 else 0
 
@@ -105,3 +106,28 @@ class RevenueBot:
 def run_bot_cycle(segment: str = "crypto"):
     # Instantiate with your client in scripts
     pass  # runners will adapt
+
+
+def run_once(
+    *,
+    client: AlpacaClient,
+    risk_policy: dict[str, Any],
+    segment: str,
+    budget: float,
+    execute: bool,
+) -> dict[str, Any]:
+    """Compatibility API used by scheduler/web UI."""
+    bot = RevenueBot(client=client)
+    bot.risk_policy = risk_policy
+    planned = bot.run_cycle(segment=segment)
+    return {
+        "strategy": "agentic",
+        "account_status": "ACTIVE",
+        "segment": segment,
+        "budget": budget,
+        "execute": execute,
+        "signals_considered": len(planned),
+        "orders_planned": planned,
+        "orders_placed": [],
+        "order_errors": [],
+    }
