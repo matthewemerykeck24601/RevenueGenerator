@@ -26,6 +26,10 @@ class AiSignalDecision:
     planned_order: dict[str, Any] | None
 
 
+_AI_COOLDOWN_UNTIL: dict[str, datetime] = {}
+_AI_CONSEC_ERRORS: dict[str, int] = {}
+
+
 def _to_float(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
@@ -73,6 +77,7 @@ def _log_ai_call(
     response_text: str = "",
     error: str = "",
     elapsed_ms: int | None = None,
+    prompt_version: str = "",
 ) -> None:
     path = Path("logs") / "ai_calls.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +89,7 @@ def _log_ai_call(
         "budget": budget,
         "status": status,
         "elapsed_ms": elapsed_ms,
+        "prompt_version": prompt_version,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
         "prompt": prompt,
         "response_text": response_text,
@@ -209,42 +215,40 @@ def build_ai_prompt(
         )
 
     return f"""
-You are a conservative, risk-aware trading signal generator for live execution on Alpaca.
+You are an elite, conservative-yet-opportunistic trading signal generator for live execution on Alpaca and kraken. Your only goal is to generate the highest-probability, positive-expectancy trades while strictly respecting risk limits.
 
-Segment: {segment} (focus especially on penny stocks if applicable — they are volatile, illiquid, prone to pumps/dumps and manipulation).
+Segment: {segment} (if penny stocks, be extremely skeptical of pumps without real volume + catalyst).
 
 Current budget: ${budget:.2f}
-Max position size % of budget: {max_pos:.2f}%
+Max position size: {max_pos:.2f}% of budget
 Max open positions: {max_open}
 Allowed symbols: {", ".join(allowed_symbols)}
-Baseline hard stop-loss: -{stop_loss:.2f}%
-First target: +{tp1:.2f}% -> scale out 40%
-Second target: +{tp2:.2f}% -> scale out another 30%
+Hard stop-loss: -{stop_loss:.2f}%
+First target: +{tp1:.2f}% (scale out 40%)
+Second target: +{tp2:.2f}% (scale out another 30%)
 Trailing stop: {trailing_stop:.1f}%
 
 {rule_context}
 
 {market_context}
 
-Strict rules for LIVE trading:
-- Only BUY if you see a clear, realistic positive edge AFTER accounting for spreads/slippage (pennies often have 5-20% effective spreads).
-- Confidence must be >= {min_conf:.2f} and expected_edge >= {min_edge:.2f} for any BUY.
-- Estimated execution costs for this segment are ~{est_cost_bps:.0f} bps. After subtracting these costs, the net expected_edge must be >= {min_net_edge:.4f}. Target a gross edge well above {min_edge:.2f} to clear this hurdle.
-- If edge is marginal or market looks choppy/manipulated, return HOLD.
-- Never exceed position limits or use symbols outside allowlist.
-- For penny stocks, be extra skeptical of volume spikes without fundamental/news catalyst.
-- For HOLD, set "symbol" to null and position_size_pct_of_budget to 0.
-- Use exact symbol formatting from allowlist (for example BTC/USD, not BTCUSDT).
-- Output ONLY valid JSON, no extra text.
+=== STRICT LIVE TRADING RULES ===
+- ONLY BUY if you see a **clear, realistic positive edge** AFTER spreads, slippage, and commissions.
+- Minimums: confidence ≥ {min_conf:.2f}, gross expected_edge ≥ {min_edge:.2f}, **net** expected_edge (after ~{est_cost_bps:.0f} bps costs) ≥ {min_net_edge:.4f}.
+- The setup must have favorable risk/reward vs your actual stop-loss and targets.
+- For penny stocks: require strong volume confirmation + catalyst. Ignore random spikes.
+- If multiple symbols qualify, pick the single highest-conviction one only.
+- If the edge is marginal, choppy, or manipulated → return HOLD.
+- Never exceed position limits or use unlisted symbols.
 
-Schema (exact):
+=== OUTPUT ONLY VALID JSON (no other text) ===
 {{
   "decision": "BUY|HOLD",
   "symbol": "SYMBOL_OR_NULL",
   "segment": "{segment}",
-  "confidence": 0.0,
-  "expected_edge": 0.0,
-  "position_size_pct_of_budget": 0.0,
+  "confidence": 0.85,
+  "expected_edge": 0.042,
+  "position_size_pct_of_budget": 4.5,
   "entry": {{
     "order_type": "limit|market",
     "limit_price": 0.0,
@@ -252,7 +256,401 @@ Schema (exact):
   }},
   "reasoning": ["bullet 1", "bullet 2", "bullet 3"]
 }}
+
+=== FEW-SHOT EXAMPLES ===
+
+Example 1 — Strong BUY:
+{{
+  "decision": "BUY",
+  "symbol": "AAPL",
+  "segment": "stocks",
+  "confidence": 0.88,
+  "expected_edge": 0.065,
+  "position_size_pct_of_budget": 5.0,
+  "entry": {{"order_type": "limit", "limit_price": 0.0, "time_in_force": "gtc"}},
+  "reasoning": [
+    "1d +4.2% on above-average volume, 5d +11.8%",
+    "Clear breakout above resistance with institutional accumulation signals",
+    "Risk/reward 1:2.8 vs stop-loss and targets — net edge after costs = +6.1%"
+  ]
+}}
+
+Example 2 — HOLD:
+{{
+  "decision": "HOLD",
+  "symbol": null,
+  "segment": "crypto",
+  "confidence": 0.45,
+  "expected_edge": 0.008,
+  "position_size_pct_of_budget": 0.0,
+  "entry": {{"order_type": "limit", "limit_price": 0.0, "time_in_force": "gtc"}},
+  "reasoning": [
+    "Sideways price action, low volume, no catalyst",
+    "Expected edge does not clear cost hurdle after slippage",
+    "Better opportunities exist elsewhere"
+  ]
+}}
+
+Now analyze the data above and output only JSON.
 """.strip()
+
+
+def build_ai_exit_prompt(
+    *,
+    symbol: str,
+    segment: str,
+    trigger: str,
+    entry_price: float,
+    current_price: float,
+    pnl_pct: float,
+    peak_price: float,
+    peak_drop_pct: float,
+    held_minutes: float,
+    thresholds: dict[str, float],
+) -> str:
+    return f"""
+You are an EXIT advisor for a live trading bot. Return HOLD only when there is a strong, near-term rebound case.
+
+Symbol: {symbol}
+Segment: {segment}
+Current trigger candidate: {trigger}
+Entry price: {entry_price:.8f}
+Current price: {current_price:.8f}
+Unrealized pnl_pct: {pnl_pct:.4f}
+Peak price since tracked: {peak_price:.8f}
+Drawdown from peak_pct: {peak_drop_pct:.4f}
+Held minutes: {held_minutes:.2f}
+
+Active thresholds:
+- first_target_pct: {thresholds.get("first_target_pct", 0.0):.4f}
+- second_target_pct: {thresholds.get("second_target_pct", 0.0):.4f}
+- trailing_stop_pct: {thresholds.get("trailing_stop_pct", 0.0):.4f}
+- break_even_buffer_pct: {thresholds.get("break_even_buffer_pct", 0.0):.4f}
+- hard_stop_loss_pct: {thresholds.get("hard_stop_loss_pct", 0.0):.4f}
+
+Hard risk constraints:
+- hard_stop_loss is always absolute and cannot be deferred.
+- Be conservative: if uncertainty is high, prefer EXIT.
+- Output JSON only, no extra text.
+
+Schema (exact):
+{{
+  "decision": "EXIT|HOLD",
+  "confidence": 0.0,
+  "expected_rebound_pct": 0.0,
+  "reasoning": ["bullet 1", "bullet 2"]
+}}
+""".strip()
+
+
+def run_ai_exit_advisor(
+    *,
+    symbol: str,
+    segment: str,
+    trigger: str,
+    entry_price: float,
+    current_price: float,
+    pnl_pct: float,
+    peak_price: float,
+    peak_drop_pct: float,
+    held_minutes: float,
+    thresholds: dict[str, float],
+    timeout_seconds: int = 8,
+) -> dict[str, Any]:
+    started = datetime.now(timezone.utc)
+    prompt = build_ai_exit_prompt(
+        symbol=symbol,
+        segment=segment,
+        trigger=trigger,
+        entry_price=entry_price,
+        current_price=current_price,
+        pnl_pct=pnl_pct,
+        peak_price=peak_price,
+        peak_drop_pct=peak_drop_pct,
+        held_minutes=held_minutes,
+        thresholds=thresholds,
+    )
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if anthropic_key:
+        provider = "anthropic"
+        model = os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": anthropic_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 250,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(4, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", [])
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+            response_text = "\n".join([t for t in text_parts if t]).strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=f"exit:{segment}",
+                budget=0.0,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PROMPT_VERSION", "exit-single-v1"),
+            )
+            return _extract_json_object(response_text)
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=f"exit:{segment}",
+                budget=0.0,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PROMPT_VERSION", "exit-single-v1"),
+            )
+            raise RuntimeError(f"anthropic exit advisor call failed: {err}") from err
+
+    if openai_key:
+        provider = "openai"
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 220,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(4, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices", [])
+            response_text = ""
+            if choices:
+                response_text = str(((choices[0] or {}).get("message") or {}).get("content") or "").strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=f"exit:{segment}",
+                budget=0.0,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PROMPT_VERSION", "exit-single-v1"),
+            )
+            return _extract_json_object(response_text)
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment=f"exit:{segment}",
+                budget=0.0,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PROMPT_VERSION", "exit-single-v1"),
+            )
+            raise RuntimeError(f"openai exit advisor call failed: {err}") from err
+
+    raise RuntimeError("No AI provider key configured for exit advisor.")
+
+
+def build_ai_exit_portfolio_prompt(
+    *,
+    positions: list[dict[str, Any]],
+    default_sell_pct: float,
+) -> str:
+    compact = []
+    for p in positions[:60]:
+        compact.append(
+            {
+                "symbol": p.get("symbol"),
+                "segment": p.get("segment"),
+                "pnl_pct": p.get("pnl_pct"),
+                "held_minutes": p.get("held_minutes"),
+                "peak_drop_pct": p.get("peak_drop_pct"),
+                "entry_price": p.get("entry_price"),
+                "current_price": p.get("current_price"),
+                "qty": p.get("qty"),
+                "rule_candidate_trigger": p.get("rule_candidate_trigger"),
+            }
+        )
+    return f"""
+You are a conservative EXIT decision model for a live trading bot.
+For each position below, decide SELL or HOLD.
+
+Rules:
+- SELL only when downside risk is likely to dominate near-term rebound probability.
+- HOLD when trend/momentum likely supports recovery.
+- Output JSON only.
+- Use symbols exactly as provided.
+- If SELL, choose sell_pct 1-100. Use {default_sell_pct:.1f} as default unless strong reason otherwise.
+
+Schema:
+{{
+  "actions": [
+    {{
+      "symbol": "SYMBOL",
+      "decision": "SELL|HOLD",
+      "sell_pct": 0.0,
+      "confidence": 0.0,
+      "reason": "short reason"
+    }}
+  ]
+}}
+
+Positions:
+{json.dumps(compact, ensure_ascii=False)}
+""".strip()
+
+
+def run_ai_exit_portfolio_analysis(
+    *,
+    positions: list[dict[str, Any]],
+    timeout_seconds: int = 15,
+    default_sell_pct: float = 100.0,
+) -> dict[str, Any]:
+    started = datetime.now(timezone.utc)
+    prompt = build_ai_exit_portfolio_prompt(
+        positions=positions,
+        default_sell_pct=default_sell_pct,
+    )
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    anthropic_err: RuntimeError | None = None
+    if anthropic_key:
+        provider = "anthropic"
+        model = os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": anthropic_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 1200,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(6, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", [])
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+            response_text = "\n".join([t for t in text_parts if t]).strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment="exit:portfolio",
+                budget=0.0,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PORTFOLIO_PROMPT_VERSION", "exit-portfolio-v1"),
+            )
+            obj = _extract_json_object(response_text)
+            actions = obj.get("actions", [])
+            return {"actions": actions if isinstance(actions, list) else []}
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment="exit:portfolio",
+                budget=0.0,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PORTFOLIO_PROMPT_VERSION", "exit-portfolio-v1"),
+            )
+            anthropic_err = RuntimeError(f"anthropic exit portfolio call failed: {err}")
+            if not openai_key:
+                raise anthropic_err from err
+
+    if openai_key:
+        provider = "openai"
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1200,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=max(6, timeout_seconds))
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices", [])
+            response_text = ""
+            if choices:
+                response_text = str(((choices[0] or {}).get("message") or {}).get("content") or "").strip()
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment="exit:portfolio",
+                budget=0.0,
+                prompt=prompt,
+                status="ok",
+                response_text=response_text,
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PORTFOLIO_PROMPT_VERSION", "exit-portfolio-v1"),
+            )
+            obj = _extract_json_object(response_text)
+            actions = obj.get("actions", [])
+            return {"actions": actions if isinstance(actions, list) else []}
+        except Exception as err:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            _log_ai_call(
+                provider=provider,
+                model=model,
+                segment="exit:portfolio",
+                budget=0.0,
+                prompt=prompt,
+                status="error",
+                error=str(err),
+                elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_EXIT_PORTFOLIO_PROMPT_VERSION", "exit-portfolio-v1"),
+            )
+            if anthropic_err is not None:
+                raise RuntimeError(f"{anthropic_err}; openai exit portfolio call failed: {err}") from err
+            raise RuntimeError(f"openai exit portfolio call failed: {err}") from err
+
+    if anthropic_err is not None:
+        raise anthropic_err
+    raise RuntimeError("No AI provider key configured for exit portfolio analysis.")
 
 
 def run_ai_analysis(
@@ -277,6 +675,7 @@ def run_ai_analysis(
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
+    anthropic_err: RuntimeError | None = None
     if anthropic_key:
         provider = "anthropic"
         model = os.getenv("AI_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
@@ -312,6 +711,7 @@ def run_ai_analysis(
                 status="ok",
                 response_text=response_text,
                 elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_BUY_PROMPT_VERSION", "buy-elite-v1"),
             )
             return _extract_json_object(response_text)
         except Exception as err:
@@ -325,8 +725,11 @@ def run_ai_analysis(
                 status="error",
                 error=str(err),
                 elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_BUY_PROMPT_VERSION", "buy-elite-v1"),
             )
-            raise RuntimeError(f"anthropic call failed: {err}") from err
+            anthropic_err = RuntimeError(f"anthropic call failed: {err}")
+            if not openai_key:
+                raise anthropic_err from err
 
     if openai_key:
         provider = "openai"
@@ -356,6 +759,7 @@ def run_ai_analysis(
                 status="ok",
                 response_text=response_text,
                 elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_BUY_PROMPT_VERSION", "buy-elite-v1"),
             )
             return _extract_json_object(response_text)
         except Exception as err:
@@ -369,9 +773,14 @@ def run_ai_analysis(
                 status="error",
                 error=str(err),
                 elapsed_ms=elapsed_ms,
+                prompt_version=os.getenv("AI_BUY_PROMPT_VERSION", "buy-elite-v1"),
             )
+            if anthropic_err is not None:
+                raise RuntimeError(f"{anthropic_err}; openai call failed: {err}") from err
             raise RuntimeError(f"openai call failed: {err}") from err
 
+    if anthropic_err is not None:
+        raise anthropic_err
     raise RuntimeError("No AI provider key configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env.")
 
 
@@ -439,6 +848,15 @@ def validate_and_plan_signal(
     if equity <= 0:
         equity = budget
     alloc = min(budget * (size_pct / 100.0), equity * (size_pct / 100.0))
+    if decision == "BUY" and "/" in symbol:
+        guards = risk_policy.get("orderSizingGuards", {})
+        cash_buffer_pct = float(guards.get("cryptoAvailableCashBufferPct", 2.0)) if isinstance(guards, dict) else 2.0
+        use_buying_power = bool(guards.get("cryptoAvailableCashUseBuyingPower", True)) if isinstance(guards, dict) else True
+        cash_raw = _to_float(account.get("cash"))
+        bp_raw = _to_float(account.get("buying_power"))
+        spendable = max(bp_raw if use_buying_power else cash_raw, 0.0)
+        spendable = spendable * max(0.0, 1.0 - (cash_buffer_pct / 100.0))
+        alloc = min(alloc, spendable)
     max_notional_by_segment = risk_policy.get("maxOrderNotionalUsdBySegment", {})
     min_notional_by_segment = risk_policy.get("minOrderNotionalUsdBySegment", {})
     max_notional_global = float(risk_policy.get("maxOrderNotionalUsd", 0.0))
@@ -540,6 +958,20 @@ def run_ai_cycle(
         account_snapshot["equity"] = combined_equity
     equity_mode = apply_equity_mode_switch(policy_effective, account=account_snapshot)
     ai_cfg = policy_effective.get("aiScheduler", {})
+    now_utc = datetime.now(timezone.utc)
+    cooldown_until = _AI_COOLDOWN_UNTIL.get(segment)
+    if cooldown_until is not None and cooldown_until > now_utc:
+        preview = {
+            "segment": segment,
+            "budget": budget,
+            "execute": execute,
+            "ai_used": False,
+            "ai_skipped_reason": "ai_provider_error_cooldown",
+            "ai_error_cooldown_remaining_seconds": int(max((cooldown_until - now_utc).total_seconds(), 0)),
+            "equity_mode": equity_mode,
+            "fear_climate": fear_meta,
+        }
+        return preview
     timeout_seconds = int(ai_cfg.get("aiTimeoutSeconds", ai_cfg.get("openclawTimeoutSeconds", 35)))
     segment_cfg = (policy_effective.get("allowedSegments") or {}).get(segment, {})
     base_symbols = segment_cfg.get("symbolsAllowlist") or SEGMENT_UNIVERSE.get(segment, [])
@@ -665,15 +1097,36 @@ def run_ai_cycle(
         preview["ai_skipped_reason"] = "prefilter_below_threshold"
         return preview
 
-    signal = run_ai_analysis(
-        segment=segment,
-        budget=budget,
-        allowed_symbols=allowed_symbols,
-        risk_policy=risk_policy,
-        timeout_seconds=timeout_seconds,
-        rule_based_signals=rule_based_signals,
-        market_context=market_context,
-    )
+    try:
+        signal = run_ai_analysis(
+            segment=segment,
+            budget=budget,
+            allowed_symbols=allowed_symbols,
+            risk_policy=risk_policy,
+            timeout_seconds=timeout_seconds,
+            rule_based_signals=rule_based_signals,
+            market_context=market_context,
+        )
+        _AI_CONSEC_ERRORS[segment] = 0
+        _AI_COOLDOWN_UNTIL.pop(segment, None)
+    except Exception as err:
+        error_cooldown = int(ai_cfg.get("aiErrorCooldownSeconds", 300))
+        max_error_cooldown = int(ai_cfg.get("aiMaxErrorCooldownSeconds", 1800))
+        failures = int(_AI_CONSEC_ERRORS.get(segment, 0)) + 1
+        _AI_CONSEC_ERRORS[segment] = failures
+        backoff_seconds = max(1, min(error_cooldown * (2 ** max(failures - 1, 0)), max_error_cooldown))
+        _AI_COOLDOWN_UNTIL[segment] = now_utc + timedelta(seconds=backoff_seconds)
+        return {
+            "segment": segment,
+            "budget": budget,
+            "execute": execute,
+            "ai_used": False,
+            "ai_skipped_reason": "ai_provider_error_cooldown",
+            "ai_error": str(err),
+            "ai_error_backoff_seconds": backoff_seconds,
+            "equity_mode": equity_mode,
+            "fear_climate": fear_meta,
+        }
     account = account_snapshot
     positions = client.get_open_positions()
     decision = validate_and_plan_signal(

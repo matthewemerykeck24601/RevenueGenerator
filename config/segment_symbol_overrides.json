@@ -1,10 +1,12 @@
 {
-  "updated_at": "2026-03-27T18:30:21.350572+00:00",
+  "updated_at": "2026-03-27T19:45:50.779252+00:00",
   "symbols": {
     "AAPL": "largeCapStocks",
+    "ABBV": "largeCapStocks",
     "AMD": "largeCapStocks",
     "AMZN": "largeCapStocks",
     "BITF": "pennyStocks",
+    "CAT": "largeCapStocks",
     "CIFR": "largeCapStocks",
     "COP": "largeCapStocks",
     "CTRM": "pennyStocks",

@@ -1175,7 +1175,7 @@ LIVE_HTML = """
             </table>
             <h3 style="margin:10px 0 4px; font-size:13px; color:#f7931a;">Recent Trades</h3>
             <table id="krakenTradesTable">
-              <thead><tr><th>Pair</th><th>Side</th><th>Price</th><th>Vol</th><th>Cost</th><th>Fee</th></tr></thead>
+              <thead><tr><th>Time (ET)</th><th>Pair</th><th>Side</th><th>Price</th><th>Vol</th><th>Cost</th><th>Fee</th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
@@ -1188,6 +1188,18 @@ LIVE_HTML = """
       const fmtPct = (n) => `${Number(n || 0).toFixed(2)}%`;
       const ET_ZONE = "America/New_York";
       const fmtEtTime = (d) => new Date(d).toLocaleTimeString([], { timeZone: ET_ZONE, hour: "numeric", minute: "2-digit", second: "2-digit" });
+      const fmtEtEpoch = (secs) => {
+        const n = Number(secs || 0);
+        if (!n) return "--";
+        return new Date(n * 1000).toLocaleString([], {
+          timeZone: ET_ZONE,
+          month: "2-digit",
+          day: "2-digit",
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      };
       const colorPnL = (el, v) => { el.classList.remove("good","bad"); el.classList.add(Number(v) >= 0 ? "good" : "bad"); };
 
       const ctx = document.getElementById("equityChart").getContext("2d");
@@ -1560,7 +1572,7 @@ LIVE_HTML = """
         for (const t of k.recent_trades) {
           const tr = document.createElement("tr");
           const sideClass = t.side === "buy" ? "sideBuy" : "sideSell";
-          tr.innerHTML = `<td>${t.pair}</td><td><span class="sideTag ${sideClass}">${t.side.toUpperCase()}</span></td><td>${fmt(t.price)}</td><td>${Number(t.volume).toFixed(6)}</td><td>${fmt(t.cost)}</td><td>${fmt(t.fee)}</td>`;
+          tr.innerHTML = `<td>${fmtEtEpoch(t.time)} ET</td><td>${t.pair}</td><td><span class="sideTag ${sideClass}">${t.side.toUpperCase()}</span></td><td>${fmt(t.price)}</td><td>${Number(t.volume).toFixed(6)}</td><td>${fmt(t.cost)}</td><td>${fmt(t.fee)}</td>`;
           trBody.appendChild(tr);
         }
       }
@@ -1568,7 +1580,7 @@ LIVE_HTML = """
       refresh();
       refreshKraken();
       setInterval(refresh, 5000);
-      setInterval(refreshKraken, 5000);
+      setInterval(refreshKraken, 15000);
     </script>
   </body>
 </html>
@@ -1585,13 +1597,13 @@ def _build_kraken_payload() -> dict[str, Any]:
     if _kraken_cache["payload"] and (now - _kraken_cache["ts"]) < _KRAKEN_CACHE_TTL:
         return _kraken_cache["payload"]
     try:
-        balance = kraken_client._private("Balance")
+        balance = kraken_client._private("Balance", cache_ttl_seconds=3.0)
         time.sleep(1.5)
-        trade_bal = kraken_client._private("TradeBalance", {"asset": "ZUSD"})
+        trade_bal = kraken_client._private("TradeBalance", {"asset": "ZUSD"}, cache_ttl_seconds=6.0)
         time.sleep(1.5)
-        open_orders_raw = kraken_client._private("OpenOrders").get("open", {})
+        open_orders_raw = kraken_client._private("OpenOrders", cache_ttl_seconds=5.0).get("open", {})
         time.sleep(1.5)
-        trades_raw = kraken_client._private("TradesHistory").get("trades", {})
+        trades_raw = kraken_client._private("TradesHistory", cache_ttl_seconds=20.0).get("trades", {})
     except Exception as err:
         if _kraken_cache["payload"]:
             return _kraken_cache["payload"]

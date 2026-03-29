@@ -74,6 +74,10 @@
   "maxOrderNotionalUsdBySegment": {
     "crypto": 650.0
   },
+  "orderSizingGuards": {
+    "cryptoAvailableCashBufferPct": 2.0,
+    "cryptoAvailableCashUseBuyingPower": true
+  },
   "buyCooldownMinutes": 20,
   "buyCooldownMinutesBySegment": {
     "crypto": 2
@@ -152,11 +156,11 @@
       "largeCapStocks",
       "crypto"
     ],
-    "advisoryOnlySegments": [
-      "crypto"
-    ],
-    "fallbackToRuleEngine": true,
+    "advisoryOnlySegments": [],
+    "fallbackToRuleEngine": false,
     "aiTimeoutSeconds": 45,
+    "aiErrorCooldownSeconds": 300,
+    "aiMaxErrorCooldownSeconds": 1800,
     "prefilterScoreThreshold": 0.004,
     "prefilterScoreThresholdBySegment": {
       "crypto": 0.0,
@@ -191,6 +195,26 @@
       3,
       4
     ]
+  },
+  "aiExitAdvisor": {
+    "enabled": true,
+    "mode": "signal_dependent",
+    "evaluateEveryPosition": true,
+    "segments": [
+      "crypto"
+    ],
+    "timeoutSeconds": 8,
+    "nearTargetBufferPct": 0.2,
+    "nearStopBufferPct": 0.2,
+    "nearTrailingBufferPct": 0.2,
+    "minConfidence": 0.62,
+    "minSellConfidence": 0.58,
+    "minSellPct": 25.0,
+    "defaultSellPct": 100.0,
+    "minExpectedReboundPct": 0.15,
+    "maxDeferralsPerTrigger": 2,
+    "emergencyStopLossPct": 6.0,
+    "logPath": "logs/ai_exit_advisor.jsonl"
   },
   "sectorCadence": {
     "indexFunds": {

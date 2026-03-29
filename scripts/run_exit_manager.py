@@ -136,6 +136,10 @@ def main() -> int:
                         "cooldown": int(result.get("reliability_suppressed_cooldown", 0)),
                         "min_qty": int(result.get("reliability_suppressed_min_qty", 0)),
                     },
+                    "ai_exit_advisor": {
+                        "calls": int(result.get("ai_advisor_calls", 0)),
+                        "deferrals": int(result.get("ai_advisor_deferrals", 0)),
+                    },
                     "consecutive_errors": consecutive_errors,
                 }
             )

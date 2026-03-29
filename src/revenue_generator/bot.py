@@ -136,6 +136,7 @@ def build_orders(
     open_positions: int,
     risk_policy: dict[str, Any],
     segment: str = "",
+    available_cash_cap: float | None = None,
 ) -> list[PlannedOrder]:
     max_open_positions = int(risk_policy.get("maxOpenPositions", 5))
     max_daily_loss_pct = float(risk_policy.get("maxDailyLossPct", 2.0))
@@ -160,6 +161,8 @@ def build_orders(
 
     orders: list[PlannedOrder] = []
     remaining_budget = budget
+    if available_cash_cap is not None:
+        remaining_budget = min(remaining_budget, max(float(available_cash_cap), 0.0))
     for sig in signals:
         spread_cost_pct = max(sig.spread_bps, 0.0) / 10000.0
         slippage_cost_pct = (crypto_slippage_bps if "/" in sig.symbol else stock_slippage_bps) / 10000.0
@@ -322,6 +325,23 @@ def run_once(
     min_expected_edge = float(min_edge_by_segment.get(segment, policy_effective.get("minExpectedEdge", 0.0))) if isinstance(min_edge_by_segment, dict) else float(policy_effective.get("minExpectedEdge", 0.0))
     max_signals = int(segment_cfg.get("maxSignals", 3))
 
+    available_cash_cap: float | None = None
+    if segment == "crypto":
+        try:
+            from .kraken_client import KrakenClient as _KC
+
+            if isinstance(client, _KC):
+                guards = policy_effective.get("orderSizingGuards", {})
+                cash_buffer_pct = float(guards.get("cryptoAvailableCashBufferPct", 2.0)) if isinstance(guards, dict) else 2.0
+                use_buying_power = bool(guards.get("cryptoAvailableCashUseBuyingPower", True)) if isinstance(guards, dict) else True
+                cash_raw = float(account.get("cash", "0") or 0.0)
+                bp_raw = float(account.get("buying_power", "0") or 0.0)
+                spendable = max(bp_raw if use_buying_power else cash_raw, 0.0)
+                spendable = spendable * max(0.0, 1.0 - (cash_buffer_pct / 100.0))
+                available_cash_cap = spendable
+        except Exception:
+            available_cash_cap = None
+
     stale_minutes = int(policy_effective.get("cancelOpenOrdersAfterMinutes", 20))
     cancel_open_before_run = bool(policy_effective.get("cancelOpenOrdersBeforeRun", True))
     cancelled_order_ids: list[str] = []
@@ -466,6 +486,7 @@ def run_once(
         open_positions=len(positions),
         risk_policy=policy_effective,
         segment=segment,
+        available_cash_cap=available_cash_cap,
     )
 
     placed: list[dict[str, Any]] = []

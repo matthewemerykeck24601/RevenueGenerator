@@ -49,6 +49,10 @@ def _parse_price(snapshot: dict[str, Any]) -> float | None:
 def _parse_iso_utc(value: str | None) -> datetime | None:
     if not value:
         return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _floor_decimals(value: float, decimals: int) -> float:
@@ -56,10 +60,6 @@ def _floor_decimals(value: float, decimals: int) -> float:
         return 0.0
     scale = 10 ** max(decimals, 0)
     return math.floor(value * scale) / scale
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 class ExitManager:
@@ -88,6 +88,24 @@ class ExitManager:
         self.generic_error_backoff_seconds = int(reliability.get("genericErrorBackoffSeconds", 45))
         self.max_backoff_seconds = int(reliability.get("maxBackoffSeconds", 900))
         self.crypto_min_sell_qty = float(reliability.get("cryptoMinSellQty", 0.00001))
+        ai_exit = risk_policy.get("aiExitAdvisor", {})
+        self.ai_exit_enabled = bool(ai_exit.get("enabled", False))
+        self.ai_exit_segments = {str(s) for s in (ai_exit.get("segments") or []) if str(s)}
+        self.ai_exit_mode = str(ai_exit.get("mode", "assist")).strip().lower()
+        self.ai_exit_evaluate_every_position = bool(ai_exit.get("evaluateEveryPosition", False))
+        self.ai_exit_timeout_seconds = int(ai_exit.get("timeoutSeconds", 8))
+        self.ai_exit_near_target_buffer_pct = float(ai_exit.get("nearTargetBufferPct", 0.20))
+        self.ai_exit_near_stop_buffer_pct = float(ai_exit.get("nearStopBufferPct", 0.20))
+        self.ai_exit_near_trailing_buffer_pct = float(ai_exit.get("nearTrailingBufferPct", 0.20))
+        self.ai_exit_min_confidence = float(ai_exit.get("minConfidence", 0.62))
+        self.ai_exit_min_sell_confidence = float(ai_exit.get("minSellConfidence", self.ai_exit_min_confidence))
+        self.ai_exit_min_sell_pct = float(ai_exit.get("minSellPct", 20.0))
+        self.ai_exit_default_sell_pct = float(ai_exit.get("defaultSellPct", 100.0))
+        self.ai_exit_min_rebound_pct = float(ai_exit.get("minExpectedReboundPct", 0.15))
+        self.ai_exit_max_defer_cycles = int(ai_exit.get("maxDeferralsPerTrigger", 2))
+        self.ai_exit_emergency_stop_loss_pct = float(ai_exit.get("emergencyStopLossPct", 6.0))
+        self.ai_exit_log_path = Path(ai_exit.get("logPath", "logs/ai_exit_advisor.jsonl"))
+        self.ai_exit_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _cfg_for_symbol(self, symbol: str) -> ExitConfig:
         hooks = dict(self.risk_policy.get("exitHooks", {}))
@@ -215,6 +233,56 @@ class ExitManager:
         except (TypeError, ValueError):
             return default
 
+    def _segment_for_symbol(self, symbol: str) -> str:
+        if _is_crypto_symbol(symbol):
+            return "crypto"
+        allowed = self.risk_policy.get("allowedSegments", {})
+        if not isinstance(allowed, dict):
+            return "other"
+        for seg in ("largeCapStocks", "indexFunds", "pennyStocks"):
+            seg_cfg = allowed.get(seg, {})
+            if not isinstance(seg_cfg, dict):
+                continue
+            allowlist = seg_cfg.get("symbolsAllowlist", [])
+            if isinstance(allowlist, list) and symbol in allowlist:
+                return seg
+        return "other"
+
+    @staticmethod
+    def _trigger_near_threshold(
+        *,
+        trigger: str,
+        pnl_pct: float,
+        peak_drop_pct: float,
+        held_minutes: float,
+        max_hold_minutes: float,
+        cfg: ExitConfig,
+        target_buffer: float,
+        stop_buffer: float,
+        trailing_buffer: float,
+    ) -> bool:
+        if trigger == "first_target_partial":
+            return abs(pnl_pct - cfg.first_target_pct) <= target_buffer
+        if trigger == "second_target_partial":
+            return abs(pnl_pct - cfg.second_target_pct) <= target_buffer
+        if trigger == "break_even_exit":
+            return abs(pnl_pct - cfg.break_even_buffer_pct) <= target_buffer
+        if trigger == "trailing_stop_exit":
+            return abs(peak_drop_pct - cfg.trailing_stop_pct) <= trailing_buffer
+        if trigger == "max_hold_time_exit":
+            if max_hold_minutes <= 0:
+                return False
+            return held_minutes <= (max_hold_minutes + max(1.0, stop_buffer))
+        return False
+
+    def _log_ai_exit_advisor(self, payload: dict[str, Any]) -> None:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        with open(self.ai_exit_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     def run_cycle(self, *, execute: bool) -> dict[str, Any]:
         positions = self._all_open_positions()
         if not positions:
@@ -262,8 +330,93 @@ class ExitManager:
         reliability_suppressed_backoff = 0
         reliability_suppressed_cooldown = 0
         reliability_suppressed_min_qty = 0
+        ai_advisor_calls = 0
+        ai_advisor_deferrals = 0
         now_utc = datetime.now(timezone.utc)
         active_symbols = {str(p.get("symbol") or "") for p in positions if p.get("symbol")}
+        ai_sell_map: dict[str, dict[str, Any]] = {}
+
+        if self.ai_exit_enabled and self.ai_exit_evaluate_every_position and positions:
+            try:
+                from .ai_bridge import run_ai_exit_portfolio_analysis
+
+                contexts: list[dict[str, Any]] = []
+                for pos in positions:
+                    symbol = str(pos.get("symbol") or "")
+                    if not symbol:
+                        continue
+                    if symbol not in prices:
+                        continue
+                    segment = self._segment_for_symbol(symbol)
+                    if self.ai_exit_segments and segment not in self.ai_exit_segments:
+                        continue
+                    entry = float(pos.get("avg_entry_price", "0") or 0)
+                    qty = _position_side_qty(pos)
+                    if entry <= 0 or qty <= 0:
+                        continue
+                    current = prices[symbol]
+                    pnl_pct = ((current - entry) / entry) * 100.0
+                    symbol_state = symbols_state.setdefault(
+                        symbol,
+                        {
+                            "peak_price": current,
+                            "first_target_hit": False,
+                            "second_target_hit": False,
+                            "first_seen_at": now_utc.isoformat(),
+                        },
+                    )
+                    peak = max(float(symbol_state.get("peak_price", current)), current)
+                    symbol_state["peak_price"] = peak
+                    first_seen_at = _parse_iso_utc(str(symbol_state.get("first_seen_at") or "")) or now_utc
+                    held_minutes = max((now_utc - first_seen_at).total_seconds() / 60.0, 0.0)
+                    peak_drop_pct = ((peak - current) / peak * 100.0) if peak > 0 else 0.0
+                    # Rule candidate is provided as context only; execution can remain AI-dependent.
+                    rule_candidate_trigger = None
+                    cfg = self._cfg_for_symbol(symbol)
+                    max_hold_minutes = self._segment_value("maxHoldMinutes", symbol, 0.0)
+                    max_hold_exit_min_pnl_pct = self._segment_value("maxHoldExitMinPnlPct", symbol, 0.05)
+                    if pnl_pct <= -cfg.hard_stop_loss_pct:
+                        rule_candidate_trigger = "hard_stop_loss"
+                    elif max_hold_minutes > 0 and held_minutes >= max_hold_minutes and pnl_pct >= max_hold_exit_min_pnl_pct:
+                        rule_candidate_trigger = "max_hold_time_exit"
+                    elif symbol_state.get("first_target_hit") and pnl_pct <= cfg.break_even_buffer_pct:
+                        rule_candidate_trigger = "break_even_exit"
+                    elif peak_drop_pct >= cfg.trailing_stop_pct and pnl_pct > 0:
+                        rule_candidate_trigger = "trailing_stop_exit"
+                    elif not symbol_state.get("second_target_hit") and pnl_pct >= cfg.second_target_pct:
+                        rule_candidate_trigger = "second_target_partial"
+                    elif not symbol_state.get("first_target_hit") and pnl_pct >= cfg.first_target_pct:
+                        rule_candidate_trigger = "first_target_partial"
+
+                    contexts.append(
+                        {
+                            "symbol": symbol,
+                            "segment": segment,
+                            "pnl_pct": round(pnl_pct, 6),
+                            "held_minutes": round(held_minutes, 2),
+                            "peak_drop_pct": round(peak_drop_pct, 6),
+                            "entry_price": entry,
+                            "current_price": current,
+                            "qty": qty,
+                            "rule_candidate_trigger": rule_candidate_trigger,
+                        }
+                    )
+                if contexts:
+                    portfolio_ai = run_ai_exit_portfolio_analysis(
+                        positions=contexts,
+                        timeout_seconds=self.ai_exit_timeout_seconds,
+                        default_sell_pct=self.ai_exit_default_sell_pct,
+                    )
+                    for item in portfolio_ai.get("actions", []):
+                        if not isinstance(item, dict):
+                            continue
+                        sym = str(item.get("symbol") or "")
+                        if not sym:
+                            continue
+                        ai_sell_map[sym] = item
+                    ai_advisor_calls += 1
+            except Exception as err:
+                self._log_ai_exit_advisor({"portfolio_error": str(err)})
 
         for pos in positions:
             symbol = pos["symbol"]
@@ -320,6 +473,104 @@ class ExitManager:
                 symbol_state["first_target_hit"] = True
 
             if not trigger or sell_qty <= 0:
+                trigger = None
+                sell_qty = 0.0
+
+            # Optional AI-dependent mode: AI decides HOLD/SELL on every position,
+            # with an emergency deep-loss stop as catastrophic protection.
+            if self.ai_exit_enabled and self.ai_exit_mode == "signal_dependent":
+                ai_item = ai_sell_map.get(symbol)
+                ai_decision = str((ai_item or {}).get("decision", "")).upper()
+                ai_conf = float((ai_item or {}).get("confidence", 0.0) or 0.0)
+                ai_sell_pct = float((ai_item or {}).get("sell_pct", self.ai_exit_default_sell_pct) or self.ai_exit_default_sell_pct)
+                if ai_decision == "SELL" and ai_conf >= self.ai_exit_min_sell_confidence and ai_sell_pct >= self.ai_exit_min_sell_pct:
+                    trigger = "ai_signal_exit"
+                    sell_qty = self._sell_qty(symbol, qty, min(max(ai_sell_pct, 0.0), 100.0))
+                elif self.ai_exit_emergency_stop_loss_pct > 0 and pnl_pct <= -abs(self.ai_exit_emergency_stop_loss_pct):
+                    trigger = "emergency_hard_stop"
+                    sell_qty = qty
+                else:
+                    trigger = None
+                    sell_qty = 0.0
+
+            if not trigger or sell_qty <= 0:
+                continue
+
+            advisor_recommendation: dict[str, Any] | None = None
+            ai_advisor_deferred = False
+            symbol_segment = self._segment_for_symbol(symbol)
+            should_consider_ai = (
+                self.ai_exit_enabled
+                and trigger != "hard_stop_loss"
+                and trigger in {"first_target_partial", "second_target_partial", "trailing_stop_exit", "break_even_exit", "max_hold_time_exit"}
+                and (not self.ai_exit_segments or symbol_segment in self.ai_exit_segments)
+                and self._trigger_near_threshold(
+                    trigger=trigger,
+                    pnl_pct=pnl_pct,
+                    peak_drop_pct=peak_drop_pct,
+                    held_minutes=held_minutes,
+                    max_hold_minutes=max_hold_minutes,
+                    cfg=cfg,
+                    target_buffer=self.ai_exit_near_target_buffer_pct,
+                    stop_buffer=self.ai_exit_near_stop_buffer_pct,
+                    trailing_buffer=self.ai_exit_near_trailing_buffer_pct,
+                )
+            )
+            if should_consider_ai:
+                try:
+                    from .ai_bridge import run_ai_exit_advisor
+
+                    ai_advisor_calls += 1
+                    advisor_recommendation = run_ai_exit_advisor(
+                        symbol=symbol,
+                        segment=symbol_segment,
+                        trigger=trigger,
+                        entry_price=entry,
+                        current_price=current,
+                        pnl_pct=pnl_pct,
+                        peak_price=peak,
+                        peak_drop_pct=peak_drop_pct,
+                        held_minutes=held_minutes,
+                        thresholds={
+                            "first_target_pct": cfg.first_target_pct,
+                            "second_target_pct": cfg.second_target_pct,
+                            "trailing_stop_pct": cfg.trailing_stop_pct,
+                            "break_even_buffer_pct": cfg.break_even_buffer_pct,
+                            "hard_stop_loss_pct": cfg.hard_stop_loss_pct,
+                        },
+                        timeout_seconds=self.ai_exit_timeout_seconds,
+                    )
+                    decision = str((advisor_recommendation or {}).get("decision", "EXIT")).upper()
+                    confidence = float((advisor_recommendation or {}).get("confidence", 0.0) or 0.0)
+                    expected_rebound_pct = float((advisor_recommendation or {}).get("expected_rebound_pct", 0.0) or 0.0)
+                    deferred_count = int(symbol_state.get("ai_defer_count", 0) or 0)
+                    if (
+                        decision == "HOLD"
+                        and confidence >= self.ai_exit_min_confidence
+                        and expected_rebound_pct >= self.ai_exit_min_rebound_pct
+                        and deferred_count < max(self.ai_exit_max_defer_cycles, 0)
+                    ):
+                        symbol_state["ai_defer_count"] = deferred_count + 1
+                        ai_advisor_deferrals += 1
+                        ai_advisor_deferred = True
+                    else:
+                        symbol_state["ai_defer_count"] = 0
+                except Exception as err:
+                    advisor_recommendation = {"error": str(err)}
+
+                self._log_ai_exit_advisor(
+                    {
+                        "symbol": symbol,
+                        "segment": symbol_segment,
+                        "trigger": trigger,
+                        "pnl_pct": pnl_pct,
+                        "peak_drop_pct": peak_drop_pct,
+                        "held_minutes": held_minutes,
+                        "recommendation": advisor_recommendation,
+                        "executed_action": "defer_hold" if ai_advisor_deferred else "proceed_exit",
+                    }
+                )
+            if ai_advisor_deferred:
                 continue
 
             retry_after = _parse_iso_utc(str(symbol_state.get("retry_after") or ""))
@@ -424,6 +675,7 @@ class ExitManager:
                 "pnl_pct": pnl_pct,
                 "peak_drop_pct": peak_drop_pct,
                 "execute": execute,
+                "ai_exit_advisor": advisor_recommendation,
                 "order_result": order_result,
             }
             actions.append(action)
@@ -457,6 +709,8 @@ class ExitManager:
             "reliability_suppressed_backoff": reliability_suppressed_backoff,
             "reliability_suppressed_cooldown": reliability_suppressed_cooldown,
             "reliability_suppressed_min_qty": reliability_suppressed_min_qty,
+            "ai_advisor_calls": ai_advisor_calls,
+            "ai_advisor_deferrals": ai_advisor_deferrals,
             "pdt_daytrade_count": daytrade_count,
             "pdt_threshold": pdt_threshold,
             "pdt_near_limit": pdt_near_limit,

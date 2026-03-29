@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import math
 import os
+import random
+import threading
 import time
 import urllib.parse
 from typing import Any
@@ -74,6 +76,13 @@ class KrakenClient:
         self._kraken_to_friendly: dict[str, str] = {}
         self._friendly_to_kraken: dict[str, str] = {}
         self._asset_to_symbol: dict[str, str] = {}
+        self._private_cache: dict[str, tuple[float, Any]] = {}
+        self._private_lock = threading.Lock()
+        self._last_private_call_at = 0.0
+        self._private_cooldown_until = 0.0
+        self.private_min_interval_seconds = max(float(os.getenv("KRAKEN_PRIVATE_MIN_INTERVAL_SECONDS", "0.35")), 0.0)
+        self.private_max_retries = max(int(os.getenv("KRAKEN_PRIVATE_MAX_RETRIES", "3")), 0)
+        self.private_backoff_seconds = max(float(os.getenv("KRAKEN_PRIVATE_BACKOFF_SECONDS", "1.0")), 0.1)
         self._load_pair_metadata()
 
     _EXCLUDED_BASES = {
@@ -88,7 +97,20 @@ class KrakenClient:
     }
 
     def _asset_to_alpaca_symbol(self, asset: str) -> str | None:
-        return self._asset_to_symbol.get(asset)
+        # Prefer dynamic map discovered from Kraken AssetPairs metadata.
+        if asset in self._asset_to_symbol:
+            return self._asset_to_symbol.get(asset)
+        # Kraken assets can vary prefixes (e.g., XXRP vs XRP, XDG vs XXDG).
+        normalized_candidates = {
+            asset,
+            asset.lstrip("X"),
+            asset.lstrip("Z"),
+            asset.lstrip("XZ"),
+        }
+        for key in normalized_candidates:
+            if key in self._asset_to_symbol:
+                return self._asset_to_symbol.get(key)
+        return self._fallback_asset_to_symbol(asset)
 
     def _load_pair_metadata(self) -> None:
         try:
@@ -189,36 +211,82 @@ class KrakenClient:
             raise RuntimeError(f"Kraken API error: {body['error']}")
         return body.get("result", {})
 
-    def _private(self, endpoint: str, data: dict[str, Any] | None = None) -> Any:
+    def _cache_key(self, endpoint: str, data: dict[str, Any] | None = None) -> str:
+        payload = dict(data or {})
+        parts = [f"{k}={payload[k]}" for k in sorted(payload.keys())]
+        return f"{endpoint}|{'&'.join(parts)}"
+
+    def _private(self, endpoint: str, data: dict[str, Any] | None = None, *, cache_ttl_seconds: float = 0.0) -> Any:
+        if cache_ttl_seconds > 0:
+            key = self._cache_key(endpoint, data)
+            cached = self._private_cache.get(key)
+            if cached:
+                expires_at, cached_value = cached
+                if time.monotonic() < expires_at:
+                    return cached_value
+
         url_path = f"/0/private/{endpoint}"
         url = f"{self.BASE}{url_path}"
-        payload = dict(data or {})
-        payload["nonce"] = str(time.time_ns())
-        headers = {
-            "API-Key": self.api_key,
-            "API-Sign": self._sign(url_path, payload),
-            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        }
-        resp = requests.post(url, headers=headers, data=urllib.parse.urlencode(payload), timeout=self.timeout)
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("error"):
-            raise RuntimeError(f"Kraken API error: {body['error']}")
-        return body.get("result", {})
+        last_error: RuntimeError | None = None
+        for attempt in range(self.private_max_retries + 1):
+            with self._private_lock:
+                now = time.monotonic()
+                cooldown_wait = max(self._private_cooldown_until - now, 0.0)
+                if cooldown_wait > 0:
+                    time.sleep(cooldown_wait)
+                    now = time.monotonic()
+                gap_wait = max(self.private_min_interval_seconds - (now - self._last_private_call_at), 0.0)
+                if gap_wait > 0:
+                    time.sleep(gap_wait)
+                self._last_private_call_at = time.monotonic()
+
+            payload = dict(data or {})
+            payload["nonce"] = str(time.time_ns())
+            headers = {
+                "API-Key": self.api_key,
+                "API-Sign": self._sign(url_path, payload),
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            }
+            resp = requests.post(url, headers=headers, data=urllib.parse.urlencode(payload), timeout=self.timeout)
+            resp.raise_for_status()
+            body = resp.json()
+            errors = body.get("error") or []
+            if errors:
+                is_rate_limit = any("rate limit" in str(e).lower() for e in errors)
+                if is_rate_limit and attempt < self.private_max_retries:
+                    backoff = self.private_backoff_seconds * (2 ** attempt) + random.uniform(0.0, 0.25)
+                    with self._private_lock:
+                        self._private_cooldown_until = max(self._private_cooldown_until, time.monotonic() + backoff)
+                    continue
+                last_error = RuntimeError(f"Kraken API error: {errors}")
+                break
+            result = body.get("result", {})
+            if cache_ttl_seconds > 0:
+                self._private_cache[self._cache_key(endpoint, data)] = (time.monotonic() + cache_ttl_seconds, result)
+            return result
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Kraken private call failed without a specific error.")
 
     # ── Account ────────────────────────────────────────────────────────
 
     def get_account(self) -> dict[str, Any]:
         """Return account-like dict compatible with Alpaca shape."""
-        balance = self._private("Balance")
-        usd = float(balance.get("ZUSD", balance.get("USD", 0)))
-        total = sum(float(v) for v in balance.values())
+        balance = self._private("Balance", cache_ttl_seconds=2.0)
+        trade_bal = self._private("TradeBalance", {"asset": "ZUSD"}, cache_ttl_seconds=2.0)
+        usd = float(balance.get("ZUSD", balance.get("USD", 0)) or 0.0)
+        equity_usd = float(trade_bal.get("eb", 0.0) or 0.0)
+        free_margin_usd = float(trade_bal.get("mf", usd) or usd)
+        # Fallback if TradeBalance is unavailable.
+        if equity_usd <= 0:
+            equity_usd = usd
         return {
             "status": "ACTIVE",
-            "equity": str(total),
-            "last_equity": str(total),
+            "equity": str(equity_usd),
+            "last_equity": str(equity_usd),
             "cash": str(usd),
-            "buying_power": str(usd),
+            "buying_power": str(max(free_margin_usd, 0.0)),
             "currency": "USD",
             "pattern_day_trader": False,
             "daytrade_count": 0,
@@ -226,7 +294,7 @@ class KrakenClient:
 
     def get_open_positions(self) -> list[dict[str, Any]]:
         """Return Alpaca-shaped position list from Kraken balances."""
-        balance = self._private("Balance")
+        balance = self._private("Balance", cache_ttl_seconds=2.0)
         avg_entry_map = self.get_avg_entry_prices()
         positions: list[dict[str, Any]] = []
         for asset, qty_str in balance.items():
@@ -253,7 +321,7 @@ class KrakenClient:
         symbol_filter = set(symbols or [])
         avg_prices: dict[str, float] = {}
         try:
-            trades_raw = self._private("TradesHistory").get("trades", {})
+            trades_raw = self._private("TradesHistory", cache_ttl_seconds=20.0).get("trades", {})
         except Exception:
             return avg_prices
 
@@ -301,7 +369,7 @@ class KrakenClient:
         return avg_prices
 
     @staticmethod
-    def _asset_to_alpaca_symbol(kraken_asset: str) -> str | None:
+    def _fallback_asset_to_symbol(kraken_asset: str) -> str | None:
         asset_map = {
             "XXBT": "BTC/USD", "XBT": "BTC/USD",
             "XETH": "ETH/USD", "ETH": "ETH/USD",
@@ -313,6 +381,7 @@ class KrakenClient:
             "UNI": "UNI/USD",
             "AAVE": "AAVE/USD",
             "XXDG": "DOGE/USD", "XDG": "DOGE/USD",
+            "XXRP": "XRP/USD", "XRP": "XRP/USD",
             "DOT": "DOT/USD",
             "SHIB": "SHIB/USD",
             "XTZ": "XTZ/USD",
@@ -322,6 +391,9 @@ class KrakenClient:
             "CRV": "CRV/USD",
             "SUSHI": "SUSHI/USD",
             "ALGO": "ALGO/USD",
+            "TAO": "TAO/USD",
+            "SUI": "SUI/USD",
+            "HYPE": "HYPE/USD",
         }
         return asset_map.get(kraken_asset)
 
@@ -335,10 +407,10 @@ class KrakenClient:
         **_kwargs: Any,
     ) -> list[dict[str, Any]]:
         if status == "open":
-            result = self._private("OpenOrders")
+            result = self._private("OpenOrders", cache_ttl_seconds=3.0)
             raw = result.get("open", {})
         else:
-            result = self._private("ClosedOrders")
+            result = self._private("ClosedOrders", cache_ttl_seconds=8.0)
             raw = result.get("closed", {})
         orders: list[dict[str, Any]] = []
         for txid, info in raw.items():
