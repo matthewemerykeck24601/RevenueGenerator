@@ -85,8 +85,9 @@ def main():
 
             logger.info(f"Cycle {cycle} completed: {len(executed)} signals executed in paper mode")
 
-            # Frequent exits for profit realization & capital churn
-            exits = exit_manager.evaluate_and_execute_exits(dry_run=True)
+            # Improved exits: real paper submission + force clear only on first cycle
+            force_clear = cycle == 1
+            exits = exit_manager.evaluate_and_execute_exits(dry_run=False, force_clear_old=force_clear)
             if exits:
                 logger.info(f"Exits/partials processed this cycle: {len(exits)}")
 

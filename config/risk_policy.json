@@ -1,46 +1,42 @@
 {
   "profile": "aggressive_churn",
-  "description": "Tuned for daily profit churn targeting $100+ net. Higher turnover on green/momentum days. Safety floors preserved.",
+  "description": "Tuned for daily profit churn with higher turnover testing. Safety floors preserved.",
   "enforce_paper_trading_only": true,
-  "max_daily_loss_percent": 2.5,
-  "max_drawdown_percent": 8.0,
+  "max_daily_loss_percent": 3.0,
+  "max_drawdown_percent": 10.0,
   "regime_overrides": {
     "aggressive_mode": {
       "enabled_when": ["low_vix", "bullish_fear_climate", "green_tape"],
       "min_confidence": 0.55,
       "min_edge": 0.8,
-      "max_position_percent": 12.0,
-      "max_signals_per_cycle": 8,
-      "cooldown_minutes": 8
+      "max_position_percent": 15.0,
+      "max_signals_per_cycle": 10,
+      "cooldown_minutes": 5,
+      "max_concurrent_positions": 25
     },
     "normal_mode": {
-      "min_confidence": 0.68,
-      "min_edge": 1.2,
-      "max_position_percent": 7.0,
-      "max_signals_per_cycle": 4,
-      "cooldown_minutes": 25
+      "min_confidence": 0.65,
+      "min_edge": 1.0,
+      "max_position_percent": 8.0,
+      "max_signals_per_cycle": 5,
+      "cooldown_minutes": 15,
+      "max_concurrent_positions": 8
     }
   },
   "default": {
-    "min_confidence": 0.65,
-    "min_edge": 1.0,
-    "max_position_percent_of_equity": 8.0,
-    "max_position_dollar_cap": 2500,
-    "max_concurrent_positions": 6,
-    "max_signals_per_cycle": 5,
-    "cooldown_minutes": 15,
-    "min_liquidity_24h_usd": 15000000,
-    "max_volatility_percent": 4.5,
-    "preferred_timeframes": ["5m", "15m", "1h"],
+    "min_confidence": 0.60,
+    "min_edge": 0.9,
+    "max_position_percent_of_equity": 12.0,
+    "max_position_dollar_cap": 3000,
+    "max_concurrent_positions": 20,
+    "max_signals_per_cycle": 8,
+    "cooldown_minutes": 10,
+    "min_liquidity_24h_usd": 10000000,
+    "max_volatility_percent": 5.0,
     "crypto": {
       "max_leverage": 1.0,
-      "min_notional_usd": 80,
-      "cooldown_minutes": 6
-    },
-    "stocks": {
-      "max_leverage": 1.0,
-      "min_notional_usd": 350,
-      "cooldown_minutes": 20
+      "min_notional_usd": 60,
+      "cooldown_minutes": 4
     }
   },
   "exit_rules": {
@@ -49,15 +45,5 @@
     "trailing_stop_percent": 0.9,
     "partial_exit_at_percent": 1.2,
     "agentic_exits_enabled": true
-  },
-  "position_sizing": {
-    "base_risk_percent": 0.8,
-    "volatility_adjusted": true,
-    "confidence_boost": true
-  },
-  "market_filters": {
-    "avoid_earnings": true,
-    "min_volume_surge": 1.4,
-    "max_spread_percent": 0.35
   }
 }

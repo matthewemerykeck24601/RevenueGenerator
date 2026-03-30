@@ -136,13 +136,24 @@ class ExitManager:
                 pass
         return positions
 
-    def evaluate_and_execute_exits(self, dry_run: bool = True) -> list[Dict]:
-        """Main loop: Check all positions, apply tight rules + agentic decision on green days"""
+    def evaluate_and_execute_exits(self, dry_run: bool = False, force_clear_old: bool = False) -> list:
+        """Enhanced exits with optional first-cycle force-clear for testing."""
         positions = self._all_open_positions()
         executed = []
 
-        regime = get_regime(self.risk_policy)  # from risk.py
+        if force_clear_old:
+            logger.info(f"FORCE CLEARING {len(positions)} old positions (paper mode)")
+            for pos in positions[:]:
+                symbol = str(pos.get("symbol", ""))
+                qty = _position_side_qty(pos)
+                if qty > 0 and symbol:
+                    # Crypto-only cleanup during crypto-focused churn tests.
+                    if self._execute_exit(symbol, qty, "FORCE_TEST_CLEAR_CRYPTO", dry_run=False):
+                        executed.append({"symbol": symbol, "action": "force_clear"})
+            return executed
 
+        # Normal tight exit logic (agentic + hard stops/targets)
+        regime = get_regime(self.risk_policy)
         for pos in positions:
             symbol = str(pos.get("symbol", ""))
             if not symbol:
@@ -155,51 +166,41 @@ class ExitManager:
 
             cfg = self._cfg_for_symbol(symbol)
 
-            # Get current price
             try:
                 snapshot = self.client.get_snapshot(symbol) if not _is_crypto_symbol(symbol) else {}
                 current_price = _parse_price(snapshot) or float(pos.get("current_price", 0))
-            except:
-                current_price = entry_price * 1.01  # fallback
+            except Exception:
+                current_price = entry_price * 1.01
 
             if current_price <= 0:
                 continue
 
             unrealized_pct = (current_price - entry_price) / entry_price * 100
 
-            # Hard stop
+            # Hard stop remains highest priority
             if unrealized_pct <= -cfg.hard_stop_loss_pct:
-                self._execute_exit(symbol, qty, "HARD_STOP", dry_run)
-                executed.append({"symbol": symbol, "action": "full_exit_stop"})
+                if self._execute_exit(symbol, qty, "HARD_STOP", dry_run):
+                    executed.append({"symbol": symbol, "action": "full_exit_stop"})
                 continue
 
-            # Break-even fast
-            if unrealized_pct > cfg.break_even_buffer_pct and unrealized_pct < 0.5:
-                # move to breakeven
-                pass  # implement if needed
-
-            # Agentic decision near targets (key for churn)
+            # Agentic decision near targets
             if self.ai_exit_enabled and regime == "aggressive_mode" and unrealized_pct > 0.8:
                 agent_decision = self._get_agentic_exit_decision(symbol, unrealized_pct, qty)
                 if agent_decision.get("action") == "SELL":
                     sell_qty = qty * (agent_decision.get("sell_pct", 40) / 100.0)
-                    self._execute_exit(symbol, sell_qty, "AGENTIC_PARTIAL", dry_run)
-                    executed.append({"symbol": symbol, "action": "agentic_partial"})
+                    if self._execute_exit(symbol, sell_qty, "AGENTIC_PARTIAL", dry_run):
+                        executed.append({"symbol": symbol, "action": "agentic_partial"})
                     continue
 
             # Standard tight targets
             if unrealized_pct >= cfg.first_target_pct:
                 sell_qty = qty * (cfg.first_sell_pct / 100.0)
-                self._execute_exit(symbol, sell_qty, "FIRST_TARGET", dry_run)
-                executed.append({"symbol": symbol, "action": "first_target_partial"})
-
+                if self._execute_exit(symbol, sell_qty, "FIRST_TARGET", dry_run):
+                    executed.append({"symbol": symbol, "action": "first_target_partial"})
             elif unrealized_pct >= cfg.second_target_pct:
                 sell_qty = qty * (cfg.second_sell_pct / 100.0)
-                self._execute_exit(symbol, sell_qty, "SECOND_TARGET", dry_run)
-                executed.append({"symbol": symbol, "action": "second_target"})
-
-            # Trailing
-            # (Add simple trailing logic here if not already in state)
+                if self._execute_exit(symbol, sell_qty, "SECOND_TARGET", dry_run):
+                    executed.append({"symbol": symbol, "action": "second_target"})
 
         return executed
 
@@ -216,15 +217,55 @@ class ExitManager:
             return {"action": "HOLD"}
 
     def _execute_exit(self, symbol: str, qty: float, reason: str, dry_run: bool = True):
-        if dry_run:
-            logger.info(f"DRY-RUN EXIT: Sell {qty} {symbol} | {reason}")
-            return
-        # Real exit logic using client.place_order (sell)
+        """Execute exits with dust/non-crypto filtering and quieter failures."""
+        if qty < 0.00001:  # dust filter
+            logger.debug(f"Skipping dust exit for {symbol} (qty={qty})")
+            return False
+
+        # Best-effort notional check to avoid tiny order spam.
         try:
-            self.client.place_order(symbol=symbol, qty=qty, side="sell", order_type="market", tif="gtc" if _is_crypto_symbol(symbol) else "day")
-            logger.info(f"EXECUTED EXIT: {reason} for {qty} {symbol}")
+            latest_price = self.client.get_latest_price(symbol) if hasattr(self.client, "get_latest_price") else None
+            notional = float(latest_price or 0.0) * float(qty)
+            if notional > 0 and notional < 10.0:
+                logger.debug(f"Skipping low-notional exit for {symbol} (~${notional:.2f})")
+                return False
+        except Exception:
+            pass
+
+        if not _is_crypto_symbol(symbol) and ("crypto" in str(reason).lower() or "force_test_clear" in str(reason).lower()):
+            logger.info(f"Skipping non-crypto {symbol} during crypto-focused test")
+            return False
+
+        action_str = "DRY-RUN" if dry_run else "EXECUTED"
+        try:
+            if dry_run:
+                logger.info(f"{action_str} EXIT: Sell {qty} {symbol} | {reason}")
+                return True
+
+            if hasattr(self.client, "submit_order"):
+                self.client.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side="sell",
+                    type="market",
+                )
+            else:
+                self.client.place_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side="sell",
+                    order_type="market",
+                    tif="gtc" if _is_crypto_symbol(symbol) else "day",
+                )
+            logger.info(f"{action_str} EXIT: Sell {qty} {symbol} | {reason} (order submitted to Alpaca paper)")
+            return True
         except Exception as e:
-            logger.error(f"Exit failed for {symbol}: {e}")
+            err_str = str(e)
+            if "403" in err_str or "422" in err_str:
+                logger.warning(f"Exit skipped for {symbol} ({err_str[:80]}) - common paper/dust issue")
+            else:
+                logger.error(f"Exit failed for {symbol}: {err_str}")
+            return False
 
     def _load_state(self) -> dict:
         if self.state_path.exists():
