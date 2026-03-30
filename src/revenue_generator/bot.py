@@ -1,6 +1,5 @@
 """
-Bot Module - Finalized for Reliable Agentic Churn Execution
-Fixed journal logging + robust account fetching.
+Bot Module - Hardened Signal Passing + Debug for Edge Propagation
 """
 
 import logging
@@ -22,19 +21,14 @@ class RevenueBot:
         self.risk_policy = load_risk_policy()
 
     def _get_account_context(self):
-        """Robust account & position snapshot with fallbacks"""
         try:
-            # Try common Alpaca methods (adjust based on your client)
             account = self.client.get_account() if hasattr(self.client, "get_account") else {}
             equity = float(account.get("equity", account.get("portfolio_value", 15000.0)))
-
             positions = self.client.get_open_positions() if hasattr(self.client, "get_open_positions") else []
-            open_positions_count = len(positions)
-
-            return equity, open_positions_count
+            return equity, len(positions)
         except Exception as e:
-            logger.warning(f"Account snapshot failed ({e}), using safe defaults")
-            return 15000.0, 3  # conservative defaults for paper
+            logger.warning(f"Account snapshot failed: {e}")
+            return 15000.0, 3
 
     def run_cycle(self, segment: str = "crypto") -> List[Dict]:
         research = get_segment_research(segment)
@@ -44,14 +38,29 @@ class RevenueBot:
         equity, open_positions = self._get_account_context()
 
         agent_result = analyze_segment(segment)
-        if agent_result.get("action", "HOLD").upper() == "HOLD":
-            logger.info(f"Agent HOLD in {segment} - {agent_result.get('reason', '')}")
+
+        if agent_result.get("action", "HOLD").upper() != "BUY":
+            logger.info(f"Agent did not propose BUY in {segment}")
             return []
 
-        logger.info(f"Agent proposed: {agent_result.get('action')} {agent_result.get('ticker')} | conf {agent_result.get('confidence', 0):.2f}")
+        # Debug the raw agent output
+        raw_edge = agent_result.get("edge_percent", 0.0)
+        logger.info(f"RAW from agent: BUY {agent_result.get('ticker')} | conf {agent_result.get('confidence', 0):.2f} | edge {raw_edge:.2f}%")
+
+        # Ultra-safe deep copy of only the needed fields
+        signal_for_risk = {
+            "action": "BUY",
+            "ticker": agent_result.get("ticker"),
+            "confidence": float(agent_result.get("confidence", 0.0)),
+            "edge_percent": float(raw_edge),  # Force float from raw
+            "size_percent": float(agent_result.get("size_percent", 5.0)),
+            "rationale": agent_result.get("rationale", "agent_proposal"),
+        }
+
+        logger.info(f"Signal passed to risk: edge_percent = {signal_for_risk['edge_percent']:.2f}%")
 
         validated = validate_and_plan_signal(
-            signal=agent_result,
+            signal=signal_for_risk,
             risk_policy=self.risk_policy,
             segment=segment,
             current_equity=equity,
@@ -64,41 +73,40 @@ class RevenueBot:
             logger.info(f"Risk REJECTED: {validated.get('reason', 'unknown')}")
             return []
 
+        # Success path
         ticker = validated["ticker"]
-        size_pct = validated["size_percent"]
+        size_pct = validated.get("size_percent", 5.0)
         alloc_dollars = equity * (size_pct / 100.0)
 
-        # Get better price (from research candidates or fallback)
         price = 1000.0
         for cand in research.get("candidates", []):
-            if cand.get("ticker") == ticker:
+            if cand.get("ticker") == ticker or cand.get("ticker", "").replace("-", "") == ticker.replace("-", ""):
                 price = cand.get("price", 1000.0)
                 break
 
-        qty = alloc_dollars / price if price > 0 else 0.0
-        qty = round(qty, 6 if "-" in ticker or "USD" in ticker else 4)
+        qty = round(alloc_dollars / price, 6 if "-" in ticker else 4) if price > 0 else 0.0
 
         planned_order = {
             "symbol": ticker,
             "qty": qty,
             "limit_price": round(price * 0.999, 4),
             "confidence": validated["confidence"],
-            "edge": validated.get("edge", 0),
+            "edge": signal_for_risk["edge_percent"],
             "size_percent": size_pct,
-            "rationale": validated.get("reason", "agent_approved"),
+            "rationale": validated.get("reason", "approved"),
             "action": "BUY",
             "segment": segment,
         }
 
-        logger.info(f"APPROVED & EXECUTING (paper): BUY {qty} {ticker} (~${alloc_dollars:.0f}) | conf {validated['confidence']:.2f} | {planned_order['rationale']}")
+        logger.info(
+            f"✅ APPROVED & EXECUTING (paper): BUY {qty} {ticker} (~${alloc_dollars:.0f}) | conf {validated['confidence']:.2f} | edge {planned_order['edge']:.2f}%"
+        )
 
-        # Correct journal logging
         log_trade_signal(planned_order, approved=True, rationale=planned_order["rationale"], regime=regime)
 
         return [planned_order]
 
 
-# Backward compatibility
 def run_bot_cycle(segment: str = "crypto"):
     client = AlpacaClient()
     bot = RevenueBot(client)
