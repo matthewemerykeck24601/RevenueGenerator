@@ -1,25 +1,24 @@
 """
-run_paper_bot.py - Paper Mode Runner for Agentic Daily Profit Churn
-Test the full agentic loop (research -> AI agent -> risk gate -> execute -> exits) in paper mode.
+run_paper_bot.py - Clean Paper Mode Runner for Agentic Crypto Churn
 """
 
 import argparse
 import time
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
+# Ensure "src" package imports resolve when running as a script.
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from revenue_generator.bot import RevenueBot
-from revenue_generator.alpaca_client import AlpacaClient
-from revenue_generator.exit_manager import ExitManager
-from revenue_generator.config import build_runtime_config, load_risk_policy
-from revenue_generator.journal import TradeJournal
+from src.revenue_generator.bot import RevenueBot
+from src.revenue_generator.alpaca_client import AlpacaClient
+from src.revenue_generator.exit_manager import ExitManager
+from src.revenue_generator.config import load_risk_policy, build_runtime_config
+from src.revenue_generator.journal import TradeJournal
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -30,49 +29,25 @@ logging.basicConfig(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Paper Bot for Agentic Churn Testing")
-    parser.add_argument(
-        "--segment",
-        type=str,
-        default="crypto",
-        choices=["crypto", "stocks"],
-        help="Segment to run (crypto for 24/7 churn)",
-    )
-    parser.add_argument(
-        "--cycles",
-        type=int,
-        default=10,
-        help="Number of cycles to run (default 10 for quick testing)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=300,
-        help="Seconds between cycles (default 5 min for paper testing)",
-    )
+    parser = argparse.ArgumentParser(description="Clean Paper Bot for Daily Churn")
+    parser.add_argument("--segment", type=str, default="crypto", choices=["crypto", "stocks"])
+    parser.add_argument("--cycles", type=int, default=12, help="Number of cycles")
+    parser.add_argument("--interval", type=int, default=240, help="Seconds between cycles")
     args = parser.parse_args()
 
-    logger.info("Starting PAPER MODE Agentic Revenue Bot")
-    logger.info(f"Segment: {args.segment} | Cycles: {args.cycles} | Interval: {args.interval}s")
+    logger.info("Starting CLEAN PAPER MODE Agentic Revenue Churn Bot")
+    logger.info(f"Segment: {args.segment} | Target: $100+ daily net churn")
 
     risk_policy = load_risk_policy()
-    cfg = build_runtime_config()
-    client = AlpacaClient(cfg=cfg)  # Ensure your .env is loaded with paper keys
+    client = AlpacaClient(cfg=build_runtime_config())
     journal = TradeJournal()
 
-    # Exit manager (dry_run=True for paper)
-    exit_manager = ExitManager(
-        client=client,
-        risk_policy=risk_policy,
-        journal=journal,
-    )
-
-    # Core agentic bot
-    bot = RevenueBot(client=client)  # crypto_client if Kraken enabled
+    exit_manager = ExitManager(client=client, risk_policy=risk_policy, journal=journal)
+    bot = RevenueBot(client=client)
 
     logger.info(
-        f"Risk Profile: {risk_policy.get('profile', 'unknown')} | "
-        f"Paper trading enforced: {risk_policy.get('enforce_paper_trading_only', True)}"
+        f"Risk Profile: {risk_policy.get('profile')} | Max concurrent positions: "
+        f"{risk_policy.get('default', {}).get('max_concurrent_positions', 10)}"
     )
 
     for cycle in range(1, args.cycles + 1):
@@ -80,30 +55,26 @@ def main():
             now = datetime.now()
             logger.info(f"--- CYCLE {cycle}/{args.cycles} @ {now.strftime('%H:%M:%S')} ---")
 
-            # Agentic cycle: research + AI + risk + execute
             executed = bot.run_cycle(segment=args.segment)
+            if executed:
+                logger.info(f"Executed {len(executed)} BUY signals this cycle")
 
-            logger.info(f"Cycle {cycle} completed: {len(executed)} signals executed in paper mode")
-
-            # Improved exits: real paper submission + force clear only on first cycle
-            force_clear = cycle == 1
-            exits = exit_manager.evaluate_and_execute_exits(dry_run=False, force_clear_old=force_clear)
+            # Clean exits - no force clear
+            exits = exit_manager.evaluate_and_execute_exits(dry_run=False)
             if exits:
-                logger.info(f"Exits/partials processed this cycle: {len(exits)}")
+                logger.info(f"Processed {len(exits)} exits/partials")
 
-            # Short sleep for paper testing (increase for real run)
             if cycle < args.cycles:
                 time.sleep(args.interval)
 
         except KeyboardInterrupt:
-            logger.info("Paper bot stopped by user.")
+            logger.info("Stopped by user.")
             break
         except Exception as e:
-            logger.error(f"Cycle {cycle} error: {e}")
-            time.sleep(30)  # backoff
+            logger.error(f"Cycle error: {e}")
+            time.sleep(30)
 
-    logger.info("Paper bot run completed. Check logs/trades.db and logs/trades.csv for journal.")
-    logger.info("Review with: python scripts/weekly_review.py or live_dashboard.py")
+    logger.info("Paper run completed. Check logs/trades.db for journal and weekly_review.py for P&L.")
 
 
 if __name__ == "__main__":

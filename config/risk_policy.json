@@ -1,40 +1,36 @@
 {
   "profile": "aggressive_churn",
-  "description": "Tuned for daily profit churn with higher turnover testing. Safety floors preserved.",
+  "description": "Polished for $100+ daily net profit churn on crypto momentum. Higher turnover.",
   "enforce_paper_trading_only": true,
   "max_daily_loss_percent": 3.0,
   "max_drawdown_percent": 10.0,
   "regime_overrides": {
     "aggressive_mode": {
-      "enabled_when": ["low_vix", "bullish_fear_climate", "green_tape"],
-      "min_confidence": 0.55,
-      "min_edge": 0.8,
+      "min_confidence": 0.58,
+      "min_edge": 0.75,
       "max_position_percent": 15.0,
-      "max_signals_per_cycle": 10,
-      "cooldown_minutes": 5,
-      "max_concurrent_positions": 25
+      "max_signals_per_cycle": 12,
+      "cooldown_minutes": 4,
+      "max_concurrent_positions": 15
     },
     "normal_mode": {
       "min_confidence": 0.65,
       "min_edge": 1.0,
-      "max_position_percent": 8.0,
-      "max_signals_per_cycle": 5,
-      "cooldown_minutes": 15,
-      "max_concurrent_positions": 8
+      "max_position_percent": 10.0,
+      "max_signals_per_cycle": 6,
+      "cooldown_minutes": 12,
+      "max_concurrent_positions": 10
     }
   },
   "default": {
     "min_confidence": 0.60,
-    "min_edge": 0.9,
+    "min_edge": 0.85,
     "max_position_percent_of_equity": 12.0,
-    "max_position_dollar_cap": 3000,
-    "max_concurrent_positions": 20,
+    "max_position_dollar_cap": 3500,
+    "max_concurrent_positions": 12,
     "max_signals_per_cycle": 8,
-    "cooldown_minutes": 10,
-    "min_liquidity_24h_usd": 10000000,
-    "max_volatility_percent": 5.0,
+    "cooldown_minutes": 8,
     "crypto": {
-      "max_leverage": 1.0,
       "min_notional_usd": 60,
       "cooldown_minutes": 4
     }
