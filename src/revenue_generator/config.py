@@ -29,12 +29,24 @@ class RuntimeConfig:
 
 def build_runtime_config() -> RuntimeConfig:
     load_env_file(".env")
-    api_key = os.getenv("ALPACA_API_KEY", "").strip()
-    api_secret = os.getenv("ALPACA_API_SECRET", "").strip()
-    trading_base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip().rstrip("/")
+    api_key = (
+        os.getenv("ALPACA_PAPER_API_KEY", "").strip()
+        or os.getenv("APLACA_PAPER_API_KEY", "").strip()
+        or os.getenv("ALPACA_API_KEY", "").strip()
+    )
+    api_secret = (
+        os.getenv("ALPACA_PAPER_API_SECRET", "").strip()
+        or os.getenv("APLACA_PAPER_API_SECRET", "").strip()
+        or os.getenv("ALPACA_API_SECRET", "").strip()
+    )
+    trading_base_url = (
+        os.getenv("ALPACA_PAPER_BASE_URL", "").strip()
+        or os.getenv("APLACA_PAPER_BASE_URL", "").strip()
+        or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
+    ).rstrip("/")
     data_base_url = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip().rstrip("/")
     if not api_key or not api_secret:
-        raise ValueError("ALPACA_API_KEY and ALPACA_API_SECRET are required.")
+        raise ValueError("Set ALPACA_PAPER_API_KEY/SECRET (or ALPACA_API_KEY/SECRET).")
     return RuntimeConfig(
         api_key=api_key,
         api_secret=api_secret,

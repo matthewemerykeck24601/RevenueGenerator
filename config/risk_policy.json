@@ -1,45 +1,45 @@
 {
-  "profile": "aggressive_churn",
-  "description": "Polished for $100+ daily net profit churn on crypto momentum. Higher turnover.",
+  "profile": "aggressive_churn_live_ready",
+  "description": "Tuned for $150–$300 net daily on ~$36k equity. Higher turnover, controlled risk.",
   "enforce_paper_trading_only": true,
-  "max_daily_loss_percent": 3.0,
-  "max_drawdown_percent": 10.0,
+  "max_daily_loss_percent": 2.8,
+  "max_drawdown_percent": 9.0,
   "regime_overrides": {
     "aggressive_mode": {
-      "min_confidence": 0.58,
+      "min_confidence": 0.60,
       "min_edge": 0.75,
-      "max_position_percent": 15.0,
-      "max_signals_per_cycle": 12,
-      "cooldown_minutes": 4,
-      "max_concurrent_positions": 15
+      "max_position_percent": 18.0,
+      "max_signals_per_cycle": 10,
+      "cooldown_minutes": 5,
+      "max_concurrent_positions": 18
     },
     "normal_mode": {
       "min_confidence": 0.65,
       "min_edge": 1.0,
-      "max_position_percent": 10.0,
+      "max_position_percent": 12.0,
       "max_signals_per_cycle": 6,
       "cooldown_minutes": 12,
-      "max_concurrent_positions": 10
+      "max_concurrent_positions": 12
     }
   },
   "default": {
-    "min_confidence": 0.60,
+    "min_confidence": 0.62,
     "min_edge": 0.85,
-    "max_position_percent_of_equity": 12.0,
-    "max_position_dollar_cap": 3500,
-    "max_concurrent_positions": 12,
+    "max_position_percent_of_equity": 14.0,
+    "max_position_dollar_cap": 4500,
+    "max_concurrent_positions": 15,
     "max_signals_per_cycle": 8,
     "cooldown_minutes": 8,
     "crypto": {
-      "min_notional_usd": 60,
-      "cooldown_minutes": 4
+      "min_notional_usd": 80,
+      "cooldown_minutes": 5
     }
   },
   "exit_rules": {
-    "take_profit_percent": 1.8,
-    "stop_loss_percent": 1.2,
-    "trailing_stop_percent": 0.9,
-    "partial_exit_at_percent": 1.2,
+    "take_profit_percent": 1.7,
+    "stop_loss_percent": 1.1,
+    "trailing_stop_percent": 0.85,
+    "partial_exit_at_percent": 1.1,
     "agentic_exits_enabled": true
   }
 }

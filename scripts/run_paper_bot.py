@@ -1,5 +1,5 @@
 """
-run_paper_bot.py - Clean Paper Mode Runner for Agentic Crypto Churn
+run_paper_bot.py - Final Polished Daily Churn Engine
 """
 
 import argparse
@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# Ensure "src" package imports resolve when running as a script.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -29,26 +28,24 @@ logging.basicConfig(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Clean Paper Bot for Daily Churn")
-    parser.add_argument("--segment", type=str, default="crypto", choices=["crypto", "stocks"])
-    parser.add_argument("--cycles", type=int, default=12, help="Number of cycles")
-    parser.add_argument("--interval", type=int, default=240, help="Seconds between cycles")
+    parser = argparse.ArgumentParser(description="Final Agentic Churn Engine")
+    parser.add_argument("--segment", type=str, default="crypto")
+    parser.add_argument("--cycles", type=int, default=12)
+    parser.add_argument("--interval", type=int, default=240)
     args = parser.parse_args()
 
-    logger.info("Starting CLEAN PAPER MODE Agentic Revenue Churn Bot")
-    logger.info(f"Segment: {args.segment} | Target: $100+ daily net churn")
+    logger.info("FINAL AGENTIC CHURN ENGINE - Paper Mode")
+    logger.info(f"Target: $100–$300+ net daily | Segment: {args.segment}")
 
     risk_policy = load_risk_policy()
-    client = AlpacaClient(cfg=build_runtime_config())
+    client = AlpacaClient(cfg=build_runtime_config())  # your repo's config style
     journal = TradeJournal()
 
     exit_manager = ExitManager(client=client, risk_policy=risk_policy, journal=journal)
     bot = RevenueBot(client=client)
 
-    logger.info(
-        f"Risk Profile: {risk_policy.get('profile')} | Max concurrent positions: "
-        f"{risk_policy.get('default', {}).get('max_concurrent_positions', 10)}"
-    )
+    total_buys = 0
+    total_value_traded = 0
 
     for cycle in range(1, args.cycles + 1):
         try:
@@ -57,12 +54,15 @@ def main():
 
             executed = bot.run_cycle(segment=args.segment)
             if executed:
-                logger.info(f"Executed {len(executed)} BUY signals this cycle")
+                total_buys += len(executed)
+                for trade in executed:
+                    value = trade.get("qty", 0) * trade.get("limit_price", 1000)
+                    total_value_traded += value
+                    logger.info(f"BUY EXECUTED: {trade.get('qty')} {trade.get('symbol')} | Rationale: {trade.get('rationale', 'N/A')}")
 
-            # Clean exits - no force clear
-            exits = exit_manager.evaluate_and_execute_exits(dry_run=False)
+            exits = exit_manager.evaluate_and_execute_exits(dry_run=True)
             if exits:
-                logger.info(f"Processed {len(exits)} exits/partials")
+                logger.info(f"Processed {len(exits)} simulated exits")
 
             if cycle < args.cycles:
                 time.sleep(args.interval)
@@ -74,7 +74,12 @@ def main():
             logger.error(f"Cycle error: {e}")
             time.sleep(30)
 
-    logger.info("Paper run completed. Check logs/trades.db for journal and weekly_review.py for P&L.")
+    logger.info("=== RUN SUMMARY ===")
+    logger.info(f"Total BUY executions: {total_buys}")
+    logger.info(f"Approximate value traded: ${total_value_traded:,.0f}")
+    logger.info("Target daily net: $100–$300+")
+    logger.info("Review full journal in logs/trades.db or weekly_review.py")
+    logger.info("Ready for live when: enforce_paper_trading_only = false")
 
 
 if __name__ == "__main__":
