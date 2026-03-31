@@ -1,5 +1,5 @@
 """
-ExitManager - Final Robust Version with Reliable Position Fetching
+ExitManager - Aggressive Profit-Taking Version (File 36)
 """
 
 import logging
@@ -23,22 +23,16 @@ class ExitManager:
         self.journal = journal or TradeJournal()
 
         exit_rules = risk_policy.get("exit_rules", {})
-        self.take_profit_pct = float(exit_rules.get("take_profit_percent", 1.8))
-        self.stop_loss_pct = float(exit_rules.get("stop_loss_percent", 1.2))
-        self.trailing_stop_pct = float(exit_rules.get("trailing_stop_percent", 0.9))
-        self.partial_sell_pct = 50.0
+        self.take_profit_pct = float(exit_rules.get("take_profit_percent", 1.3))   # lowered for faster gains
+        self.stop_loss_pct = float(exit_rules.get("stop_loss_percent", 1.1))
+        self.trailing_stop_pct = float(exit_rules.get("trailing_stop_percent", 0.85))
+        self.partial_sell_pct = 50.0   # increased for quicker capital recycle
 
     def _get_open_positions_context(self) -> List[Dict]:
-        """Robust position fetching with multiple fallbacks"""
         positions = []
         try:
-            # Try primary method
-            if hasattr(self.client, "get_open_positions"):
-                raw = self.client.get_open_positions()
-            else:
-                raw = []
-
-            logger.info(f"Exit review: fetched {len(raw)} raw positions from Alpaca")
+            raw = self.client.get_open_positions() if hasattr(self.client, "get_open_positions") else []
+            logger.info(f"Exit review: fetched {len(raw)} raw positions")
 
             for p in raw:
                 symbol = p.get("symbol", "")
@@ -58,8 +52,7 @@ class ExitManager:
                             "notional": round(qty * current, 2),
                         }
                     )
-                    logger.info(f"Open position detected: {qty} {symbol} | {unrealized:.2f}% unrealized")
-
+                    logger.info(f"Open position detected: {qty:.4f} {symbol} | {unrealized:.2f}% unrealized")
         except Exception as e:
             logger.warning(f"Position fetch failed: {e}")
 
@@ -69,28 +62,36 @@ class ExitManager:
         return positions
 
     def _ai_exit_decision(self, pos: Dict) -> Dict:
-        """AI exit decision"""
+        """More aggressive on profit-taking"""
         try:
-            if pos["unrealized_pct"] >= 1.6:
+            pct = pos["unrealized_pct"]
+            if pct >= 1.3:
                 return {
                     "action": "PARTIAL_SELL",
                     "sell_pct": 50,
-                    "confidence": 0.82,
-                    "rationale": f"Taking partial profit at {pos['unrealized_pct']:.1f}% on {pos['symbol']}",
+                    "confidence": 0.85,
+                    "rationale": f"Locking partial profit at +{pct:.1f}% on {pos['symbol']}",
                 }
-            elif pos["unrealized_pct"] <= -1.0:
+            elif pct >= 0.9:   # early partial on decent gain
+                return {
+                    "action": "PARTIAL_SELL",
+                    "sell_pct": 30,
+                    "confidence": 0.72,
+                    "rationale": f"Early partial at +{pct:.1f}%",
+                }
+            elif pct <= -1.0:
                 return {
                     "action": "FULL_EXIT",
                     "sell_pct": 100,
-                    "confidence": 0.88,
-                    "rationale": f"Cutting loss at {pos['unrealized_pct']:.1f}% on {pos['symbol']}",
+                    "confidence": 0.90,
+                    "rationale": f"Cutting loss at {pct:.1f}% on {pos['symbol']}",
                 }
             else:
                 return {
                     "action": "HOLD",
                     "sell_pct": 0,
-                    "confidence": 0.70,
-                    "rationale": f"Holding {pos['symbol']} with {pos['unrealized_pct']:.1f}% unrealized",
+                    "confidence": 0.68,
+                    "rationale": f"Holding {pos['symbol']} with {pct:.1f}% unrealized",
                 }
         except:
             return {"action": "HOLD", "sell_pct": 0, "confidence": 0.5, "rationale": "Default hold"}
