@@ -1,5 +1,5 @@
 """
-Bot Module - Hardened Signal Passing + Debug for Edge Propagation
+Bot Module - Fixed Real Order Submission + Accurate Journal Logging
 """
 
 import logging
@@ -10,7 +10,7 @@ from .ai_bridge import analyze_segment
 from .risk import validate_and_plan_signal
 from .external_research import get_segment_research
 from .journal import log_trade_signal
-from .config import load_risk_policy
+from .config import load_risk_policy, build_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +22,13 @@ class RevenueBot:
 
     def _get_account_context(self):
         try:
-            account = self.client.get_account() if hasattr(self.client, "get_account") else {}
+            account = self.client.get_account() if hasattr(self.client, 'get_account') else {}
             equity = float(account.get("equity", account.get("portfolio_value", 15000.0)))
-            positions = self.client.get_open_positions() if hasattr(self.client, "get_open_positions") else []
+            positions = self.client.get_open_positions() if hasattr(self.client, 'get_open_positions') else []
             return equity, len(positions)
         except Exception as e:
             logger.warning(f"Account snapshot failed: {e}")
-            return 15000.0, 3
+            return 15000.0, 0
 
     def run_cycle(self, segment: str = "crypto") -> List[Dict]:
         research = get_segment_research(segment)
@@ -43,21 +43,17 @@ class RevenueBot:
             logger.info(f"Agent did not propose BUY in {segment}")
             return []
 
-        # Debug the raw agent output
         raw_edge = agent_result.get("edge_percent", 0.0)
         logger.info(f"RAW from agent: BUY {agent_result.get('ticker')} | conf {agent_result.get('confidence', 0):.2f} | edge {raw_edge:.2f}%")
 
-        # Ultra-safe deep copy of only the needed fields
         signal_for_risk = {
             "action": "BUY",
             "ticker": agent_result.get("ticker"),
             "confidence": float(agent_result.get("confidence", 0.0)),
-            "edge_percent": float(raw_edge),  # Force float from raw
+            "edge_percent": float(raw_edge),
             "size_percent": float(agent_result.get("size_percent", 5.0)),
-            "rationale": agent_result.get("rationale", "agent_proposal"),
+            "rationale": agent_result.get("rationale", "agent_proposal")
         }
-
-        logger.info(f"Signal passed to risk: edge_percent = {signal_for_risk['edge_percent']:.2f}%")
 
         validated = validate_and_plan_signal(
             signal=signal_for_risk,
@@ -66,14 +62,13 @@ class RevenueBot:
             current_equity=equity,
             start_equity=equity * 1.02,
             open_positions=open_positions,
-            fear_climate=fear_climate,
+            fear_climate=fear_climate
         )
 
         if not validated.get("approved", False):
             logger.info(f"Risk REJECTED: {validated.get('reason', 'unknown')}")
             return []
 
-        # Success path
         ticker = validated["ticker"]
         size_pct = validated.get("size_percent", 5.0)
         alloc_dollars = equity * (size_pct / 100.0)
@@ -95,19 +90,41 @@ class RevenueBot:
             "size_percent": size_pct,
             "rationale": validated.get("reason", "approved"),
             "action": "BUY",
-            "segment": segment,
+            "segment": segment
         }
 
-        logger.info(
-            f"✅ APPROVED & EXECUTING (paper): BUY {qty} {ticker} (~${alloc_dollars:.0f}) | conf {validated['confidence']:.2f} | edge {planned_order['edge']:.2f}%"
-        )
+        # REAL PAPER ORDER SUBMISSION
+        success = False
+        try:
+            order_resp = self.client.submit_order(
+                symbol=ticker,
+                qty=qty,
+                side="buy",
+                type="market"
+            )
+            broker_symbol = order_resp.get("symbol", ticker) if isinstance(order_resp, dict) else ticker
+            broker_order_id = order_resp.get("id", "") if isinstance(order_resp, dict) else ""
+            broker_status = order_resp.get("status", "") if isinstance(order_resp, dict) else ""
+            planned_order["symbol"] = broker_symbol
+            planned_order["broker_order_id"] = broker_order_id
+            planned_order["broker_status"] = broker_status
+            logger.info(
+                f"✅ REAL PAPER BUY SUBMITTED: {qty} {broker_symbol} (~${alloc_dollars:.0f}) "
+                f"| conf {validated['confidence']:.2f} | edge {planned_order['edge']:.2f}% | "
+                f"order_id={broker_order_id} status={broker_status}"
+            )
+            success = True
+        except Exception as e:
+            logger.error(f"Failed to submit BUY order for {ticker}: {e}")
+            planned_order["rationale"] = f"Order failed: {str(e)[:100]}"
 
-        log_trade_signal(planned_order, approved=True, rationale=planned_order["rationale"], regime=regime)
+        # Log to journal ONLY after attempting the real order
+        log_trade_signal(planned_order, approved=success, rationale=planned_order['rationale'], regime=regime)
 
-        return [planned_order]
+        return [planned_order] if success else []
 
 
 def run_bot_cycle(segment: str = "crypto"):
-    client = AlpacaClient()
+    client = AlpacaClient(cfg=build_runtime_config())
     bot = RevenueBot(client)
     return bot.run_cycle(segment)

@@ -1,5 +1,5 @@
 """
-run_paper_bot.py - Final Polished Daily Churn Engine
+run_paper_bot.py - 60-Second Cycle Version with Clean Summary
 """
 
 import argparse
@@ -22,30 +22,30 @@ from src.revenue_generator.journal import TradeJournal
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
 )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Final Agentic Churn Engine")
+    parser = argparse.ArgumentParser(description="Agentic Churn Engine - 60s Cycles")
     parser.add_argument("--segment", type=str, default="crypto")
-    parser.add_argument("--cycles", type=int, default=12)
-    parser.add_argument("--interval", type=int, default=240)
+    parser.add_argument("--cycles", type=int, default=20)   # ~20 minutes at 60s
+    parser.add_argument("--interval", type=int, default=60) # 60 seconds
     args = parser.parse_args()
 
-    logger.info("FINAL AGENTIC CHURN ENGINE - Paper Mode")
-    logger.info(f"Target: $100–$300+ net daily | Segment: {args.segment}")
+    logger.info("🚀 AGENTIC CHURN ENGINE - 60-Second Cycles")
+    logger.info(f"Target: $150–$300+ net daily | Segment: {args.segment}")
 
     risk_policy = load_risk_policy()
-    client = AlpacaClient(cfg=build_runtime_config())  # your repo's config style
+    client = AlpacaClient(cfg=build_runtime_config())   # repo config handles paper/live
     journal = TradeJournal()
 
     exit_manager = ExitManager(client=client, risk_policy=risk_policy, journal=journal)
     bot = RevenueBot(client=client)
 
     total_buys = 0
-    total_value_traded = 0
+    total_value = 0
 
     for cycle in range(1, args.cycles + 1):
         try:
@@ -57,12 +57,12 @@ def main():
                 total_buys += len(executed)
                 for trade in executed:
                     value = trade.get("qty", 0) * trade.get("limit_price", 1000)
-                    total_value_traded += value
+                    total_value += value
                     logger.info(f"BUY EXECUTED: {trade.get('qty')} {trade.get('symbol')} | Rationale: {trade.get('rationale', 'N/A')}")
 
             exits = exit_manager.evaluate_and_execute_exits(dry_run=True)
             if exits:
-                logger.info(f"Processed {len(exits)} simulated exits")
+                logger.info(f"Processed {len(exits)} exit actions")
 
             if cycle < args.cycles:
                 time.sleep(args.interval)
@@ -72,14 +72,14 @@ def main():
             break
         except Exception as e:
             logger.error(f"Cycle error: {e}")
-            time.sleep(30)
+            time.sleep(10)
 
     logger.info("=== RUN SUMMARY ===")
     logger.info(f"Total BUY executions: {total_buys}")
-    logger.info(f"Approximate value traded: ${total_value_traded:,.0f}")
-    logger.info("Target daily net: $100–$300+")
-    logger.info("Review full journal in logs/trades.db or weekly_review.py")
-    logger.info("Ready for live when: enforce_paper_trading_only = false")
+    logger.info(f"Approximate value traded: ${total_value:,.0f}")
+    logger.info(f"Target daily net: $150–$300+")
+    logger.info("Review logs/trades.db or weekly_review.py for details")
+    logger.info("Ready for live when enforce_paper_trading_only = false")
 
 
 if __name__ == "__main__":

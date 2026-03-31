@@ -32,7 +32,16 @@ class AlpacaClient:
 
     def _post(self, url: str, payload: dict[str, Any]) -> Any:
         resp = requests.post(url, headers=self.headers, data=json.dumps(payload), timeout=self.timeout)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            detail = resp.text
+            try:
+                detail = json.dumps(resp.json())
+            except Exception:
+                pass
+            raise requests.HTTPError(
+                f"{resp.status_code} Client Error for url: {url} | payload={payload} | response={detail}",
+                response=resp,
+            )
         return resp.json()
 
     def _delete(self, url: str) -> Any:
@@ -124,6 +133,32 @@ class AlpacaClient:
             payload["take_profit"] = {"limit_price": f"{take_profit_price:.2f}"}
             payload["stop_loss"] = {"stop_price": f"{stop_loss_price:.2f}"}
         return self._post(self._trading_url("/orders"), payload=payload)
+
+    def submit_order(
+        self,
+        *,
+        symbol: str,
+        qty: int | float | str,
+        side: str = "buy",
+        type: str = "market",
+        time_in_force: str | None = None,
+        limit_price: float | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = symbol.upper().replace("-", "")
+        is_crypto = "/" in normalized_symbol or normalized_symbol.endswith("USD")
+        tif = time_in_force or ("gtc" if is_crypto else "day")
+        return self.place_order(
+            symbol=normalized_symbol,
+            qty=qty,
+            side=side,
+            order_type=type,
+            tif=tif,
+            limit_price=limit_price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+        )
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return self._delete(self._trading_url(f"/orders/{order_id}"))

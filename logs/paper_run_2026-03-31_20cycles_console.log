@@ -1,0 +1,111 @@
+09:50:27 | INFO | 🚀 AGENTIC CHURN ENGINE - 60-Second Cycles
+09:50:27 | INFO | Target: $150–$300+ net daily | Segment: crypto
+09:50:27 | INFO | --- CYCLE 1/20 @ 09:50:27 ---
+09:50:36 | INFO | Agentic signal generated: BUY BTC-USD | conf 0.63 | edge 0.82%
+09:50:36 | INFO | ✅ REAL PAPER BUY SUBMITTED: 0.075864 BTC/USD (~$5101) | conf 0.63 | edge 0.82% | order_id=e777a448-a654-4a8f-b585-e9cba11c04b5 status=pending_new
+09:50:37 | INFO | Exit review: fetched 4 raw positions from Alpaca
+09:50:37 | INFO | AI HOLD ADAUSD | Holding ADAUSD with 0.2% unrealized
+09:50:37 | INFO | AI HOLD AVAXUSD | Holding AVAXUSD with 0.2% unrealized
+09:50:37 | INFO | AI HOLD BTCUSD | Holding BTCUSD with -0.1% unrealized
+09:50:37 | INFO | AI HOLD ETHUSD | Holding ETHUSD with 0.8% unrealized
+
+09:51:37 | INFO | --- CYCLE 2/20 @ 09:51:37 ---
+09:51:45 | INFO | Agentic signal generated: BUY DOGE-USD | conf 0.67 | edge 0.85%
+09:51:45 | INFO | ✅ REAL PAPER BUY SUBMITTED: 59548.662647 DOGE/USD (~$5429) | conf 0.67 | edge 0.85% | order_id=b2675b71-e39a-4230-9a2a-c10cb9016c9b status=pending_new
+
+09:52:46 | INFO | --- CYCLE 3/20 @ 09:52:46 ---
+09:52:55 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+09:52:55 | INFO | Retrying request to /v1/messages in 0.409485 seconds
+09:53:00 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+09:53:00 | INFO | Agentic signal generated: BUY ETH-USD | conf 0.63 | edge 0.85%
+09:53:00 | INFO | ✅ REAL PAPER BUY SUBMITTED: 2.459029 ETH/USD (~$5097) | conf 0.63 | edge 0.85% | order_id=72af9c8f-2003-478f-a27a-1599f790608d status=pending_new
+
+09:54:00 | INFO | --- CYCLE 4/20 @ 09:54:00 ---
+09:54:10 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.61 | edge 0.82%
+09:54:10 | INFO | ✅ REAL PAPER BUY SUBMITTED: 15228.267009 ADA/USD (~$3704) | conf 0.61 | edge 0.82% | order_id=a59b944e-ae0f-42c6-98e2-99a55240936f status=pending_new
+
+09:55:11 | INFO | --- CYCLE 5/20 @ 09:55:11 ---
+09:55:19 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.72 | edge 1.20%
+09:55:19 | INFO | ✅ REAL PAPER BUY SUBMITTED: 23928.264396 ADA/USD (~$5819) | conf 0.72 | edge 1.20% | order_id=cc643653-ead8-4c7f-916b-41c9b335ac3d status=pending_new
+
+09:56:19 | INFO | --- CYCLE 6/20 @ 09:56:19 ---
+09:56:27 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.72 | edge 1.85%
+09:56:27 | INFO | ✅ REAL PAPER BUY SUBMITTED: 25916.528336 ADA/USD (~$6306) | conf 0.72 | edge 1.85% | order_id=91948d6a-774f-4d51-9135-91a657c1b381 status=pending_new
+
+09:57:27 | INFO | --- CYCLE 7/20 @ 09:57:27 ---
+09:57:36 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.62 | edge 0.85%
+09:57:36 | INFO | ✅ REAL PAPER BUY SUBMITTED: 20564.429661 ADA/USD (~$5007) | conf 0.62 | edge 0.85% | order_id=a0bd7020-5328-4c9d-b2f6-79fef524882e status=pending_new
+
+09:58:37 | INFO | --- CYCLE 8/20 @ 09:58:37 ---
+09:58:44 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+09:58:51 | INFO | Agentic signal generated: BUY SOL-USD | conf 0.68 | edge 0.85%
+09:58:52 | INFO | ✅ REAL PAPER BUY SUBMITTED: 67.110578 SOL/USD (~$5494) | conf 0.68 | edge 0.85% | order_id=2ad829d0-06dc-4e7d-9fe3-ef6bee465039 status=pending_new
+
+09:59:52 | INFO | --- CYCLE 9/20 @ 09:59:52 ---
+10:00:05 | INFO | Agentic signal generated: BUY XRP-USD | conf 0.72 | edge 1.10%
+10:00:06 | INFO | ✅ REAL PAPER BUY SUBMITTED: 4388.43343 XRP/USD (~$5813) | conf 0.72 | edge 1.10% | order_id=b801f1ee-01f7-46dd-90f4-807159b60d6c status=pending_new
+
+10:01:06 | INFO | --- CYCLE 10/20 @ 10:01:06 ---
+10:01:15 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+10:01:20 | INFO | Agentic signal generated: BUY XRP-USD | conf 0.72 | edge 1.20%
+10:01:20 | INFO | ✅ REAL PAPER BUY SUBMITTED: 4391.988249 XRP/USD (~$5817) | conf 0.72 | edge 1.20% | order_id=db852e4b-a79e-4e69-bec1-2dc538fad1fb status=pending_new
+
+10:02:20 | INFO | --- CYCLE 11/20 @ 10:02:20 ---
+10:02:29 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+10:02:37 | INFO | Agentic signal generated: BUY XRP-USD | conf 0.72 | edge 1.15%
+10:02:38 | INFO | ✅ REAL PAPER BUY SUBMITTED: 4391.988249 XRP/USD (~$5817) | conf 0.72 | edge 1.15% | order_id=bc9a38be-dbd6-4102-ae3c-0a663d2d4b05 status=pending_new
+
+10:03:38 | INFO | --- CYCLE 12/20 @ 10:03:38 ---
+10:03:50 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.63 | edge 0.82%
+10:03:51 | INFO | ✅ REAL PAPER BUY SUBMITTED: 20909.424078 ADA/USD (~$5088) | conf 0.63 | edge 0.82% | order_id=b16ccf0a-24ae-46e7-bc87-ee0d91c4d448 status=pending_new
+
+10:04:51 | INFO | --- CYCLE 13/20 @ 10:04:51 ---
+10:05:05 | INFO | Agentic signal generated: BUY ETH-USD | conf 0.68 | edge 0.85%
+10:05:05 | INFO | ✅ REAL PAPER BUY SUBMITTED: 2.642114 ETH/USD (~$5495) | conf 0.68 | edge 0.85% | order_id=40fab83f-8e0f-42b3-95f3-11fbb7441666 status=pending_new
+
+10:06:05 | INFO | --- CYCLE 14/20 @ 10:06:05 ---
+10:06:14 | INFO | Agentic signal generated: BUY ADA-USD | conf 0.72 | edge 1.15%
+10:06:14 | ERROR | Failed to submit BUY order for ADA-USD: 403 Client Error for url: https://paper-api.alpaca.markets/v2/orders | payload={'symbol': 'ADAUSD', 'qty': '23851.893714', 'side': 'buy', 'type': 'market', 'time_in_force': 'gtc'} | response={"available": "1916.76", "balance": "29429.37", "code": 40310000, "message": "insufficient balance for USD (requested: 5914.12, available: 1916.76)", "symbol": "USD"}
+10:06:15 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:06:15 | INFO | Processed 1 exit actions
+
+10:07:15 | INFO | --- CYCLE 15/20 @ 10:07:15 ---
+10:07:23 | INFO | Agentic signal generated: BUY AVAX-USD | conf 0.72 | edge 1.10%
+10:07:24 | ERROR | Failed to submit BUY order for AVAX-USD: 403 Client Error for url: https://paper-api.alpaca.markets/v2/orders | payload={'symbol': 'AVAXUSD', 'qty': '653.752328', 'side': 'buy', 'type': 'market', 'time_in_force': 'gtc'} | response={"available": "1916.76", "balance": "29429.37", "code": 40310000, "message": "insufficient balance for USD (requested: 5924.16, available: 1916.76)", "symbol": "USD"}
+10:07:24 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:07:24 | INFO | Processed 1 exit actions
+
+10:08:24 | INFO | --- CYCLE 16/20 @ 10:08:24 ---
+10:08:33 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+10:08:41 | INFO | Agentic signal generated: HOLD  | conf 0.00 | edge 0.00%
+10:08:42 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:08:42 | INFO | Processed 1 exit actions
+
+10:09:42 | INFO | --- CYCLE 17/20 @ 10:09:42 ---
+10:09:51 | INFO | Agentic signal generated: HOLD BTC-USD | conf 0.58 | edge 0.75%
+10:09:51 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:09:51 | INFO | Processed 1 exit actions
+
+10:10:51 | INFO | --- CYCLE 18/20 @ 10:10:51 ---
+10:11:01 | INFO | HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 529 <none>"
+10:11:07 | INFO | Agentic signal generated: HOLD BTC-USD | conf 0.62 | edge 0.00%
+10:11:07 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:11:07 | INFO | Processed 1 exit actions
+
+10:12:07 | INFO | --- CYCLE 19/20 @ 10:12:07 ---
+10:12:14 | INFO | Agentic signal generated: HOLD BTC-USD | conf 0.58 | edge 0.00%
+10:12:15 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:12:15 | INFO | Processed 1 exit actions
+
+10:13:15 | INFO | --- CYCLE 20/20 @ 10:13:15 ---
+10:13:22 | INFO | Agentic signal generated: BUY SOL-USD | conf 0.72 | edge 0.85%
+10:13:22 | INFO | ✅ REAL PAPER BUY SUBMITTED: 5.802793 SOL/USD (~$5803) | conf 0.72 | edge 0.85% | order_id=47ace141-ea53-4948-beaa-1389a60f128b status=pending_new
+10:13:23 | WARNING | Exit skipped XRPUSD (403/422) → simulated
+10:13:23 | INFO | Processed 1 exit actions
+
+10:13:23 | INFO | === RUN SUMMARY ===
+10:13:23 | INFO | Total BUY executions: 14
+10:13:23 | INFO | Approximate value traded: $75,718
+10:13:23 | INFO | Target daily net: $150–$300+
+10:13:23 | INFO | Review logs/trades.db or weekly_review.py for details
+10:13:23 | INFO | Ready for live when enforce_paper_trading_only = false
